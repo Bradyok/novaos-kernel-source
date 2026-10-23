@@ -1,0 +1,21 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: regulator: rk808: bind the RK808's own regulator cell (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+The RK808 MFD registers an "rk808-regulator" cell, but the regulator
+driver's platform id table did not list it, so on an RK808 board the cell
+was never bound and none of the PMIC's regulators registered. Add the
+missing id.
+
+---
+diff --git a/drivers/regulator/rk808-regulator.c b/drivers/regulator/rk808-regulator.c
+--- a/drivers/regulator/rk808-regulator.c
++++ b/drivers/regulator/rk808-regulator.c
+@@ -1776,6 +1776,7 @@
+ 
+ static const struct platform_device_id rk8xx_regulator_id_table[] = {
+ 	{ "rk805-regulator", 0 },
++	{ "rk808-regulator", 0 },
+ 	{ "rk809-regulator", 0 },
+ 	{ "rk816-regulator", 0 },
+ 	{ "rk817-regulator", 0 },

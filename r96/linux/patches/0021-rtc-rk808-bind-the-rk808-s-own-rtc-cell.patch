@@ -1,0 +1,19 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: rtc: rk808: bind the RK808's own RTC cell (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+The RK808 MFD registers an "rk808-rtc" cell, but the RTC driver's platform
+id table did not list it, so an RK808 board had no rtc0. Add the missing id.
+
+---
+diff --git a/drivers/rtc/rtc-rk808.c b/drivers/rtc/rtc-rk808.c
+--- a/drivers/rtc/rtc-rk808.c
++++ b/drivers/rtc/rtc-rk808.c
+@@ -485,6 +485,7 @@
+ 
+ static const struct platform_device_id rk8xx_rtc_id_table[] = {
+ 	{ "rk805-rtc", 0 },
++	{ "rk808-rtc", 0 },
+ 	{ "rk809-rtc", 0 },
+ 	{ "rk816-rtc", 0 },
+ 	{ "rk817-rtc", 0 },

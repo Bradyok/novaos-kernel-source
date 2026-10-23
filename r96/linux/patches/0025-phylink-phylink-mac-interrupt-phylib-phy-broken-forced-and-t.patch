@@ -1,0 +1,138 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: phylink: phylink_mac_interrupt(); phylib: PHY_BROKEN_FORCED and the direct C45 MMD helpers (prerequisites of the AX88179A series, backported to 6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+Small additions to the kernel's network PHY layer that the newer ASIX USB
+Ethernet driver needs: a way for a USB adapter to pass its link-change
+interrupt to the PHY layer instead of polling the PHY, a flag for PHYs that
+cannot run at a forced speed, and direct Clause 45 register access helpers
+for PHYs that need them. Upstream code by Birger Koblitz (under review on
+netdev, not merged yet) and Ciprian Regus (Analog Devices; in net-next).
+
+---
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 707a6ff..e847a58 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -369,6 +369,9 @@ int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd)
+ 			switch (devad) {
+ 			case MII_BMCR:
+ 				if ((val & (BMCR_RESET | BMCR_ANENABLE)) == 0) {
++					if (phydev->drv &&
++					    (phydev->drv->flags & PHY_BROKEN_FORCED))
++						return -EOPNOTSUPP;
+ 					if (phydev->autoneg == AUTONEG_ENABLE)
+ 						change_autoneg = true;
+ 					phydev->autoneg = AUTONEG_DISABLE;
+@@ -1151,6 +1154,10 @@ int phy_ethtool_ksettings_set(struct phy_device *phydev,
+ 	      duplex != DUPLEX_FULL)))
+ 		return -EINVAL;
+ 
++	if (autoneg == AUTONEG_DISABLE && phydev->drv &&
++	    (phydev->drv->flags & PHY_BROKEN_FORCED))
++		return -EOPNOTSUPP;
++
+ 	mutex_lock(&phydev->lock);
+ 	phydev->autoneg = autoneg;
+ 
+diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index 2009b03..a272b69 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -2963,6 +2963,31 @@ int genphy_read_abilities(struct phy_device *phydev)
+ }
+ EXPORT_SYMBOL(genphy_read_abilities);
+ 
++/* Some PHYs support direct C45 register access but not C22 indirect
++ * MMD access (registers 13 and 14). When discovered via C22, phylib
++ * routes MMD access through the indirect path, which won't work on
++ * these devices. These helpers bypass indirect access and use the bus
++ * C45 accessors directly.
++ */
++int genphy_read_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum)
++{
++	struct mii_bus *bus = phydev->mdio.bus;
++	int addr = phydev->mdio.addr;
++
++	return __mdiobus_c45_read(bus, addr, devnum, regnum);
++}
++EXPORT_SYMBOL(genphy_read_mmd_c45);
++
++int genphy_write_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum,
++			 u16 val)
++{
++	struct mii_bus *bus = phydev->mdio.bus;
++	int addr = phydev->mdio.addr;
++
++	return __mdiobus_c45_write(bus, addr, devnum, regnum, val);
++}
++EXPORT_SYMBOL(genphy_write_mmd_c45);
++
+ /* This is used for the phy device which doesn't support the MMD extended
+  * register access, but it does have side effect when we are trying to access
+  * the MMD register via indirect method.
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index e6f3963..4acf908 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -1459,6 +1459,26 @@ static void phylink_link_down(struct phylink *pl)
+ 	phylink_info(pl, "Link is Down\n");
+ }
+ 
++/**
++ * phylink_mac_interrupt() - wrapper for phy_mac_interrupt()
++ * @pl: a pointer to a &struct phylink returned from phylink_create()
++ *
++ * Passes a link-change interrupt received by the MAC to phylib.
++ * This function may be called in interrupt context, and therefore cannot take
++ * a mutex. However, it is safe to assume that the reference to phy does not
++ * disappear during the call, as only an SFP module may be unplugged to make a
++ * PHY disappear. SFP modules however do not support interrupts.
++ */
++void phylink_mac_interrupt(struct phylink *pl)
++{
++	struct phy_device *phy;
++
++	phy = pl->phydev;
++	if (phy)
++		phy_mac_interrupt(phy);
++}
++EXPORT_SYMBOL_GPL(phylink_mac_interrupt);
++
+ static void phylink_resolve(struct work_struct *w)
+ {
+ 	struct phylink *pl = container_of(w, struct phylink, resolve);
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index 957fb0c..db20c3a 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -90,6 +90,7 @@ extern const int phy_10gbit_features_array[1];
+ #define PHY_RST_AFTER_CLK_EN	0x00000002
+ #define PHY_POLL_CABLE_TEST	0x00000004
+ #define PHY_ALWAYS_CALL_SUSPEND	0x00000008
++#define PHY_BROKEN_FORCED	0x00000010
+ #define MDIO_DEVICE_IS_PHY	0x80000000
+ 
+ /**
+@@ -1942,6 +1943,9 @@ static inline int genphy_no_config_intr(struct phy_device *phydev)
+ {
+ 	return 0;
+ }
++int genphy_read_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum);
++int genphy_write_mmd_c45(struct phy_device *phydev, int devnum, u16 regnum,
++			 u16 val);
+ int genphy_read_mmd_unsupported(struct phy_device *phdev, int devad,
+ 				u16 regnum);
+ int genphy_write_mmd_unsupported(struct phy_device *phdev, int devnum,
+diff --git a/include/linux/phylink.h b/include/linux/phylink.h
+index 5c01048..089ffa8 100644
+--- a/include/linux/phylink.h
++++ b/include/linux/phylink.h
+@@ -631,6 +631,7 @@ int phylink_ethtool_set_eee(struct phylink *link, struct ethtool_keee *eee);
+ int phylink_mii_ioctl(struct phylink *, struct ifreq *, int);
+ int phylink_speed_down(struct phylink *pl, bool sync);
+ int phylink_speed_up(struct phylink *pl);
++void phylink_mac_interrupt(struct phylink *pl);
+ 
+ #define phylink_zero(bm) \
+ 	bitmap_zero(bm, __ETHTOOL_LINK_MODE_MASK_NBITS)

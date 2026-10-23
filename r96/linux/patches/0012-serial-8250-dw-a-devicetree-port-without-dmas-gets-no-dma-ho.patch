@@ -1,0 +1,39 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: serial: 8250_dw: a devicetree port without "dmas" gets no DMA hookup
+Copyright (C) 2026 Olympian LED, Inc.
+
+8250_dw hooked up DMA for every port with a FIFO, so a device-tree port
+without a "dmas" property logged a DMA failure before falling back to
+interrupt mode. Such a port now runs in interrupt mode from the start; ports
+with DMA channels are unchanged.
+
+---
+diff --git a/drivers/tty/serial/8250/8250_dw.c b/drivers/tty/serial/8250/8250_dw.c
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -16,6 +16,7 @@
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/notifier.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
+@@ -699,8 +700,15 @@ static int dw8250_probe(struct platform_device *pdev)
+ 	if (!data->skip_autocfg)
+ 		dw8250_setup_port(p);
+ 
+-	/* If we have a valid fifosize, try hooking up DMA */
+-	if (p->fifosize) {
++	/*
++	 * If we have a valid fifosize, try hooking up DMA. A devicetree port gets its
++	 * channels only from its "dmas" property (8250_dma.c asks for "rx"/"tx" by name),
++	 * so a node without one has no DMA to hook up: without this check every open
++	 * attempted it and warned "failed to request DMA" (8250_port.c), and the kernel
++	 * console warned "forbid DMA for kernel console".
++	 */
++	if (p->fifosize &&
++	    (!dev_of_node(p->dev) || of_property_present(dev_of_node(p->dev), "dmas"))) {
+ 		data->data.dma.rxconf.src_maxburst = p->fifosize / 4;
+ 		data->data.dma.txconf.dst_maxburst = p->fifosize / 4;
+ 		up->dma = &data->data.dma;

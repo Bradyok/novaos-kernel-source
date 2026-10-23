@@ -1,0 +1,51 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: cpufreq: rockchip: a deferred CPU clock is a deferral, not an error
+Copyright (C) 2026 Olympian LED, Inc.
+
+When the CPU clock is not ready yet, the Rockchip cpufreq probe defers and
+succeeds later, but it printed three error lines first. Report a deferral as
+a deferral; real failures still log as errors.
+
+---
+diff --git a/drivers/cpufreq/rockchip-cpufreq.c b/drivers/cpufreq/rockchip-cpufreq.c
+--- a/drivers/cpufreq/rockchip-cpufreq.c
++++ b/drivers/cpufreq/rockchip-cpufreq.c
+@@ -646,10 +646,9 @@
+ 		}
+ 		clk = clk_get(dev, NULL);
+ 		if (IS_ERR(clk)) {
+-			dev_err(dev, "failed to get cpu%d clk\n", cpu);
+ 			ret = PTR_ERR(clk);
+-			if (ret == -EPROBE_DEFER)
+-				dev_err(dev, "cpu%d clk is not ready\n", cpu);
++			if (ret != -EPROBE_DEFER)
++				dev_err(dev, "failed to get cpu%d clk\n", cpu);
+ 			goto error;
+ 		}
+ 		clk_put(clk);
+@@ -665,10 +664,9 @@
+ 		}
+ 		reg = regulator_get_optional(dev, reg_name);
+ 		if (IS_ERR(reg)) {
+-			dev_err(dev, "failed to get cpu%d reg\n", cpu);
+ 			ret = PTR_ERR(reg);
+-			if (ret == -EPROBE_DEFER)
+-				dev_err(dev, "cpu%d reg is not ready\n", cpu);
++			if (ret != -EPROBE_DEFER)
++				dev_err(dev, "failed to get cpu%d reg\n", cpu);
+ 			goto error;
+ 		}
+ 		regulator_put(reg);
+@@ -1090,10 +1088,8 @@
+ 	bool is_opp_shared_cpu_bus = false;
+ 
+ 	ret = rockchip_cpufreq_early_init();
+-	if (ret) {
+-		pr_err("failed to init cpufreq\n");
+-		return ret;
+-	}
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret, "failed to init cpufreq\n");
+ 
+ 	list_for_each_entry(cluster, &cluster_info_list, list_head) {
+ 		cpu = cpumask_first(&cluster->cpus);

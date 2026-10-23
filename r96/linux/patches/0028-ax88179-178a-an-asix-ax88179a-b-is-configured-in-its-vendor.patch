@@ -1,0 +1,143 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: ax88179_178a: an ASIX AX88179A/B is configured in its vendor mode at enumeration, and the driver claims only that interface (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+An ASIX AX88179A/B USB gigabit Ethernet adapter is now set up in its own
+vendor mode when it is plugged in (or found at boot), so the full driver
+runs it instead of the generic CDC NCM one, and nothing has to switch the
+adapter afterwards. It is a kernel option (USB_NET_AX88179A_VENDOR_CONFIG),
+and the boot parameter ax88179_cfgselector.enable=0 turns it off.
+
+---
+diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
+index 0c14682..9a18701 100644
+--- a/drivers/net/usb/Kconfig
++++ b/drivers/net/usb/Kconfig
+@@ -219,6 +219,16 @@ config USB_NET_AX88179_178A
+ 	  This driver creates an interface named "ethX", where X depends on
+ 	  what other networking devices you have in use.
+ 
++config USB_NET_AX88179A_VENDOR_CONFIG
++	bool "Configure an ASIX AX88179A/B in its vendor mode at enumeration"
++	depends on USB_NET_AX88179_178A
++	help
++	  The ASIX AX88179A/B (0b95:1790, bcdDevice 2.00) offers a vendor-specific
++	  configuration beside CDC NCM and CDC ECM, and the USB core picks CDC NCM.
++	  Say Y to pick the vendor configuration at enumeration instead, which the
++	  ax88179_178a driver serves (a small built-in USB device driver,
++	  ax88179_cfgselector; its "enable" parameter turns it off).
++
+ config USB_NET_CDCETHER
+ 	tristate "CDC Ethernet support (smart devices such as cable modems)"
+ 	depends on USB_USBNET
+diff --git a/drivers/net/usb/Makefile b/drivers/net/usb/Makefile
+index 2ecead0..256cc89 100644
+--- a/drivers/net/usb/Makefile
++++ b/drivers/net/usb/Makefile
+@@ -14,6 +14,7 @@ obj-$(CONFIG_USB_NET_AX8817X)	+= asix.o
+ asix-y := asix_devices.o asix_common.o ax88172a.o
+ obj-$(CONFIG_USB_NET_AX88179_178A)      += ax88179.o
+ ax88179-y := ax88179_178a.o ax88179a_devices.o ax88179_lib.o
++obj-$(CONFIG_USB_NET_AX88179A_VENDOR_CONFIG) += ax88179_cfgselector.o
+ obj-$(CONFIG_USB_NET_CDCETHER)	+= cdc_ether.o
+ obj-$(CONFIG_USB_NET_CDC_EEM)	+= cdc_eem.o
+ obj-$(CONFIG_USB_NET_DM9601)	+= dm9601.o
+diff --git a/drivers/net/usb/ax88179_178a.c b/drivers/net/usb/ax88179_178a.c
+index 7c7b50b..6eb166f 100644
+--- a/drivers/net/usb/ax88179_178a.c
++++ b/drivers/net/usb/ax88179_178a.c
+@@ -1297,18 +1297,25 @@ static const struct driver_info at_umc2000sp_info = {
+ 	.tx_fixup = ax88179_tx_fixup,
+ };
+ 
++/* An AX179A-family chip's vendor interface (configuration 1). Matching the whole device instead would let this
++ * driver claim the CDC NCM / ECM interfaces of a device the core configured that way, and switch it to the vendor
++ * configuration from its bind (usb_driver_set_configuration(), a device reset) in a race with cdc_ncm. On NovaOS the
++ * configuration is chosen once, at enumeration (ax88179_cfgselector.c).
++ */
++#define AX179A_VENDOR_INTERFACE(ver)							.match_flags = USB_DEVICE_ID_MATCH_DEVICE_AND_VERSION |				       USB_DEVICE_ID_MATCH_INT_CLASS,					.idVendor = 0x0b95, .idProduct = 0x1790,					.bcdDevice_lo = (ver), .bcdDevice_hi = (ver),					.bInterfaceClass = USB_CLASS_VENDOR_SPEC
++
+ static const struct usb_device_id products[] = {
+ {
+ 	/* ASIX AX88179A USB 3.2 1000Mbit Ethernet */
+-	USB_DEVICE_VER(0x0b95, 0x1790, 0x0200, 0x0200),
++	AX179A_VENDOR_INTERFACE(0x0200),
+ 	.driver_info = (unsigned long)&ax88179a_info,
+ }, {
+ 	/* ASIX AX88772D USB 2.0 100Mbit Ethernet */
+-	USB_DEVICE_VER(0x0b95, 0x1790, 0x0300, 0x0300),
++	AX179A_VENDOR_INTERFACE(0x0300),
+ 	.driver_info = (unsigned long)&ax88772d_info,
+ }, {
+ 	/* ASIX AX88279 USB 3.2 2500Mbit Ethernet */
+-	USB_DEVICE_VER(0x0b95, 0x1790, 0x0400, 0x0400),
++	AX179A_VENDOR_INTERFACE(0x0400),
+ 	.driver_info = (unsigned long)&ax88279_info,
+ }, {
+ 	/* ASIX AX88179 10/100/1000 */
+diff --git a/drivers/net/usb/ax88179_cfgselector.c b/drivers/net/usb/ax88179_cfgselector.c
+new file mode 100644
+index 0000000..b5b2ab1
+--- /dev/null
++++ b/drivers/net/usb/ax88179_cfgselector.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * ASIX AX88179A/B: the vendor configuration at enumeration
++ *
++ * Copyright (C) 2026 Olympian LED, Inc.
++ *
++ * The AX88179A/B (0b95:1790, bcdDevice 2.00) offers three configurations: 1 vendor-specific (ax88179_178a),
++ * 2 CDC NCM (cdc_ncm), 3 CDC ECM. usb_choose_configuration() takes the first whose first interface is not
++ * vendor-specific, so without this the adapter runs as CDC NCM, which reports no link from power-up until a USB
++ * suspend/resume (cdc_ncm's ASIX kick) and carries no offloads. This usb_device_driver, built in so that it is there
++ * before the bus is enumerated (like r8152's cfgselector), picks the vendor configuration instead, so the device is
++ * configured once, in the mode ax88179_178a drives (its AX88179A support), and nothing switches it afterwards.
++ *
++ * ax88179_cfgselector.enable=0 (kernel command line, or /sys/module/ax88179_cfgselector/parameters/enable before
++ * the adapter is plugged) leaves the choice to the core again: CDC NCM.
++ */
++#include <linux/module.h>
++#include <linux/usb.h>
++
++static bool enable = true;
++module_param(enable, bool, 0644);
++MODULE_PARM_DESC(enable, "configure an ASIX AX88179A/B in its vendor configuration (default: yes)");
++
++static const struct usb_device_id ax88179a_cfgselector_table[] = {
++	{ USB_DEVICE_VER(0x0b95, 0x1790, 0x0200, 0x0200) },
++	{ }
++};
++
++static int ax88179a_cfgselector_choose_configuration(struct usb_device *udev)
++{
++	struct usb_host_config *c = udev->config;
++	int i;
++
++	if (!READ_ONCE(enable))
++		return -ENODEV;
++
++	for (i = 0; i < udev->descriptor.bNumConfigurations; i++, c++) {
++		if (c->desc.bNumInterfaces &&
++		    c->intf_cache[0]->altsetting->desc.bInterfaceClass == USB_CLASS_VENDOR_SPEC)
++			return c->desc.bConfigurationValue;
++	}
++	return -ENODEV;
++}
++
++static struct usb_device_driver ax88179a_cfgselector_driver = {
++	.name = "ax88179a-cfgselector",
++	.choose_configuration = ax88179a_cfgselector_choose_configuration,
++	.id_table = ax88179a_cfgselector_table,
++	.generic_subclass = 1,
++	.supports_autosuspend = 1,
++};
++
++static int __init ax88179a_cfgselector_init(void)
++{
++	return usb_register_device_driver(&ax88179a_cfgselector_driver, THIS_MODULE);
++}
++module_init(ax88179a_cfgselector_init);
++
++MODULE_DESCRIPTION("ASIX AX88179A/B: the vendor configuration at enumeration");
++MODULE_LICENSE("GPL");
