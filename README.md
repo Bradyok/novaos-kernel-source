@@ -38,9 +38,9 @@ On a Linux host with make, bc, flex, bison, the OpenSSL headers and an `aarch64-
 
 `BUILDING.txt` in the archive names the toolchain that gives byte-identical output.
 
-## Licence and credit
+## License and credit
 
-The Linux kernel is licensed under GPL-2.0. Our patches to it are under the licence of the files they change. Our
+The Linux kernel is licensed under GPL-2.0. Our patches to it are under the license of the files they change. Our
 board device trees are dual-licensed `GPL-2.0+ OR MIT`.
 
 Copyright (C) 2026 Olympian LED, Inc. for the patches and the files they create. Keep these notices when you
