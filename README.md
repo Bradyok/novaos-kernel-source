@@ -29,6 +29,11 @@ Every release is checked before it is published. A build from either archive alo
 kernel image, device trees and modules byte for byte. The complete tree is also built in a fresh directory with
 every network tool disabled.
 
+## The boot loaders
+
+The source of the boot loaders NovaOS builds for the same scopes (mainline U-Boot with our patches, and
+Trusted Firmware-A) is in [Bradyok/novaos-boot-source](https://github.com/Bradyok/novaos-boot-source).
+
 ## Building
 
 On a Linux host with make, bc, flex, bison, the OpenSSL headers and an `aarch64-linux-gnu-` cross compiler:
