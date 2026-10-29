@@ -1,0 +1,27 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: ax88179_178a: the AX88179A's PHY is polled, its interrupt endpoint stays silent (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+The ASIX AX88179A/B's link is now read from its PHY once a second, so the
+network interface comes up when the cable has a link, also on adapters that
+never send the link-change interrupt the driver otherwise waits for.
+
+---
+diff --git a/drivers/net/usb/ax88179a_devices.c b/drivers/net/usb/ax88179a_devices.c
+index 3fc472f..323de7c 100644
+--- a/drivers/net/usb/ax88179a_devices.c
++++ b/drivers/net/usb/ax88179a_devices.c
+@@ -456,7 +456,12 @@ static int ax88179a_init_phy(struct usbnet *dev)
+ 		return -ENODEV;
+ 	}
+ 
+-	data->phydev->irq = PHY_MAC_INTERRUPT;
++	/* phylib polls this PHY: an AX88179B (FW 1.3.0.3) on a high-speed host port sends nothing on its
++	 * interrupt endpoint -- 10 s of usbmon after an open, BMSR 0x796d (link, autoneg complete) the whole time --
++	 * so a PHY waiting for the MAC's interrupt never reports the link. An interrupt that does come still
++	 * triggers the state machine at once (ax88179a_status -> phylink_mac_interrupt).
++	 */
++	data->phydev->irq = PHY_POLL;
+ 	ret = phylink_connect_phy(data->phylink, data->phydev);
+ 	if (ret) {
+ 		netdev_err(dev->net, "Could not connect PHY\n");

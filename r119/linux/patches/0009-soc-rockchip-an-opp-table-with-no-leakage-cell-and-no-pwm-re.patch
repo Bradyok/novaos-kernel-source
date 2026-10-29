@@ -1,0 +1,53 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: soc: rockchip: an OPP table with no leakage cell, and no PWM regulators, are not errors
+Copyright (C) 2026 Olympian LED, Inc.
+
+Two optional Rockchip device-tree items were reported as errors when absent:
+an OPP table's leakage efuse cell (the voltage bin is then taken from the
+PVTM cell, as designed) and the suspend configuration's list of PWM
+regulators. Report their absence at debug level; a cell that exists but
+cannot be read still logs an error.
+
+---
+diff --git a/drivers/soc/rockchip/rockchip_opp_select.c b/drivers/soc/rockchip/rockchip_opp_select.c
+--- a/drivers/soc/rockchip/rockchip_opp_select.c
++++ b/drivers/soc/rockchip/rockchip_opp_select.c
+@@ -569,10 +569,19 @@ static int rockchip_get_leakage_v1(struct device *dev, struct device_node *np,
+ 	ret = rockchip_nvmem_cell_read_u8(np, "leakage", &value);
+ 	if (ret)
+ 		ret = rockchip_nvmem_cell_read_u8(np, lkg_name, &value);
+-	if (ret)
+-		dev_err(dev, "Failed to get %s\n", lkg_name);
+-	else
++	if (ret) {
++		/*
++		 * An OPP table with no leakage cell at all (the RK356x rkvenc table has only
++		 * "pvtm") selects its bin by other means; that is its design, not a failure.
++		 */
++		if (of_property_match_string(np, "nvmem-cell-names", "leakage") < 0 &&
++		    of_property_match_string(np, "nvmem-cell-names", lkg_name) < 0)
++			dev_dbg(dev, "no %s cell\n", lkg_name);
++		else
++			dev_err(dev, "Failed to get %s\n", lkg_name);
++	} else {
+ 		*leakage = value;
++	}
+ 
+ 	return ret;
+ }
+diff --git a/drivers/soc/rockchip/rockchip_pm_config.c b/drivers/soc/rockchip/rockchip_pm_config.c
+--- a/drivers/soc/rockchip/rockchip_pm_config.c
++++ b/drivers/soc/rockchip/rockchip_pm_config.c
+@@ -592,10 +592,11 @@ static int pm_config_probe(struct platform_device *pdev)
+ 	else
+ 		sip_smc_set_suspend_mode(WKUP_SOURCE_CONFIG, config->wakeup_config, 0);
+ 
++	/* Optional: a board with no PWM-controlled regulator has nothing to list. */
+ 	if (of_property_read_u32_array(node,
+ 				       "rockchip,pwm-regulator-config",
+ 				       &config->pwm_regulator_config, 1))
+-		dev_warn(&pdev->dev, "not set pwm-regulator-config\n");
++		dev_dbg(&pdev->dev, "not set pwm-regulator-config\n");
+ 	else
+ 		sip_smc_set_suspend_mode(PWM_REGULATOR_CONFIG,
+ 					 config->pwm_regulator_config,

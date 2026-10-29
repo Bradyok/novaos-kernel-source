@@ -1,0 +1,57 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: drm/rockchip: a plane declined by configuration, and a fully clipped plane, are not errors
+Copyright (C) 2026 Olympian LED, Inc.
+
+The Rockchip VOP drivers logged errors for two normal situations: an overlay
+plane left unregistered on purpose by the board configuration, and a plane
+that is fully clipped (for example on a disabled CRTC during a test-only
+commit). Log these at debug level; other failures still warn.
+
+---
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop.c
+@@ -2347,8 +2347,9 @@ static int vop_plane_atomic_check(struct drm_plane *plane,
+ 	if (ret)
+ 		return ret;
+ 
++	/* A fully clipped plane is a valid state, and this path returns success. */
+ 	if (!new_plane_state->visible) {
+-		DRM_ERROR("%s is invisible(src: pos[%d, %d] rect[%d x %d] dst: pos[%d, %d] rect[%d x %d]\n",
++		DRM_DEBUG_ATOMIC("%s is invisible(src: pos[%d, %d] rect[%d x %d] dst: pos[%d, %d] rect[%d x %d]\n",
+ 			  plane->name, new_plane_state->src_x >> 16, new_plane_state->src_y >> 16, new_plane_state->src_w >> 16,
+ 			  new_plane_state->src_h >> 16, new_plane_state->crtc_x, new_plane_state->crtc_y, new_plane_state->crtc_w,
+ 			  new_plane_state->crtc_h);
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c
+@@ -7682,8 +7682,12 @@ static int vop2_plane_atomic_check(struct drm_plane *plane, struct drm_atomic_st
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * A fully clipped plane is a valid state (a TEST_ONLY commit before the CRTC is
++	 * enabled clips to 0x0, drm_atomic_helper.c), and this path returns success.
++	 */
+ 	if (!pstate->visible) {
+-		DRM_ERROR("%s is invisible(src: pos[%d, %d] rect[%d x %d] dst: pos[%d, %d] rect[%d x %d]\n",
++		DRM_DEBUG_ATOMIC("%s is invisible(src: pos[%d, %d] rect[%d x %d] dst: pos[%d, %d] rect[%d x %d]\n",
+ 			  plane->name, pstate->src_x >> 16, pstate->src_y >> 16, pstate->src_w >> 16,
+ 			  pstate->src_h >> 16, pstate->crtc_x, pstate->crtc_y, pstate->crtc_w,
+ 			  pstate->crtc_h);
+@@ -18991,7 +18995,14 @@ static int vop2_create_crtc(struct vop2 *vop2, uint8_t enabled_vp_mask)
+ 		}
+ 
+ 		ret = vop2_plane_init(vop2, win, possible_crtcs);
+-		if (ret)
++		/*
++		 * -EACCES is vop2_plane_init() declining a window by configuration: an AFBC
++		 * window with disable_afbc_win, a Cluster sub-window without
++		 * support-multi-area, a VOP3 Esmart in line-buffer mode. Nothing failed.
++		 */
++		if (ret == -EACCES)
++			DRM_DEBUG_KMS("overlay plane %s not registered by configuration\n", win->name);
++		else if (ret)
+ 			DRM_WARN("failed to init overlay plane %s\n", win->name);
+ 	}
+ 

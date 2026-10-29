@@ -1,0 +1,322 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: xdma: C2H buffers pinned and mapped once, for the reads into them
+Copyright (C) 2026 Olympian LED, Inc.
+
+Add IOCTL_XDMA_PIN / IOCTL_XDMA_UNPIN to the streaming C2H character device:
+a reader's buffer is pinned, DMA-mapped and cleaned from the CPU's cache
+once, and every later read that lies inside it uses the pages' bus addresses
+kept, with one descriptor a page as before, and only invalidates the CPU's
+cache over what it read. With XDMA_PIN_CPU_READS_ONLY the caller promises
+the CPU never writes the buffer, so the clean before each read is skipped
+too. Pins end at IOCTL_XDMA_UNPIN or at close. Reads outside any pin take
+the unchanged path.
+
+---
+diff --git a/xdma/cdev_sgdma.c b/xdma/cdev_sgdma.c
+index 665e841..d661579 100755
+--- a/xdma/cdev_sgdma.c
++++ b/xdma/cdev_sgdma.c
+@@ -23,6 +23,8 @@
+ #include <linux/types.h>
+ #include <asm/cacheflush.h>
+ #include <linux/slab.h>
++#include <linux/mm.h>
++#include <linux/dma-mapping.h>
+ #include <linux/aio.h>
+ #include <linux/sched.h>
+ #include <linux/wait.h>
+@@ -373,6 +375,217 @@ err_out:
+ 	return rv;
+ }
+ 
++/*
++ * Pinned C2H buffers (IOCTL_XDMA_PIN, cdev_sgdma.h). On a host whose PCIe is not cache coherent
++ * every read of the plain path pins its pages, builds a scatterlist, cleans the buffer out of the CPU's
++ * cache before the transfer and invalidates it after, then dirties and releases each page, all in series
++ * with the transfer. A pinned buffer pays the pinning, the mapping and the clean once; a read into it
++ * builds the same one-descriptor-a-page list from the bus addresses kept, and invalidates what it read.
++ */
++#define XDMA_PINS_MAX 8
++
++struct xdma_pin {
++	unsigned long addr;
++	size_t len;
++	unsigned int npages;
++	u32 flags;
++	struct page **pages;
++	dma_addr_t *dma;	/* each page's bus address */
++};
++
++struct xdma_pins {
++	struct mutex lock;
++	unsigned int n;
++	struct xdma_pin pin[XDMA_PINS_MAX];
++};
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
++static void xdma_pin_release(struct device *dev, struct xdma_pin *p)
++{
++	unsigned int i;
++
++	for (i = 0; i < p->npages; i++)
++		if (p->dma[i])
++			dma_unmap_page_attrs(dev, p->dma[i], PAGE_SIZE, DMA_FROM_DEVICE,
++					     DMA_ATTR_SKIP_CPU_SYNC);
++	if (p->pages)
++		unpin_user_pages_dirty_lock(p->pages, p->npages, true);
++	kvfree(p->dma);
++	kvfree(p->pages);
++	memset(p, 0, sizeof(*p));
++}
++
++static void xdma_unpin_all(struct xdma_cdev *xcdev)
++{
++	struct xdma_pins *ps = xcdev->pins;
++	unsigned int i;
++
++	if (!ps)
++		return;
++	mutex_lock(&ps->lock);
++	for (i = 0; i < ps->n; i++)
++		xdma_pin_release(&xcdev->xdev->pdev->dev, &ps->pin[i]);
++	ps->n = 0;
++	mutex_unlock(&ps->lock);
++}
++
++static int ioctl_do_pin(struct xdma_cdev *xcdev, unsigned long arg)
++{
++	struct device *dev = &xcdev->xdev->pdev->dev;
++	struct xdma_engine *engine = xcdev->engine;
++	struct xdma_pin_ioctl a;
++	struct xdma_pins *ps;
++	struct xdma_pin *p;
++	unsigned int i;
++	long got;
++	int rv = 0;
++
++	if (engine->dir != DMA_FROM_DEVICE)
++		return -EINVAL;
++	if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
++		return -EFAULT;
++	if (!a.len || !PAGE_ALIGNED(a.addr) || !PAGE_ALIGNED(a.len) ||
++	    a.len > (1ULL << 30) || (a.flags & ~XDMA_PIN_CPU_READS_ONLY))
++		return -EINVAL;
++	if (!xcdev->pins) {
++		ps = kzalloc(sizeof(*ps), GFP_KERNEL);
++		if (!ps)
++			return -ENOMEM;
++		mutex_init(&ps->lock);
++		xcdev->pins = ps;
++	}
++	ps = xcdev->pins;
++	mutex_lock(&ps->lock);
++	for (i = 0; i < ps->n; i++)
++		if (a.addr < ps->pin[i].addr + ps->pin[i].len &&
++		    ps->pin[i].addr < a.addr + a.len) {
++			rv = -EEXIST;
++			goto out;
++		}
++	if (ps->n == XDMA_PINS_MAX) {
++		rv = -ENOSPC;
++		goto out;
++	}
++	p = &ps->pin[ps->n];
++	p->npages = a.len >> PAGE_SHIFT;
++	p->pages = kvcalloc(p->npages, sizeof(*p->pages), GFP_KERNEL);
++	p->dma = kvcalloc(p->npages, sizeof(*p->dma), GFP_KERNEL);
++	if (!p->pages || !p->dma) {
++		kvfree(p->pages);
++		kvfree(p->dma);
++		memset(p, 0, sizeof(*p));
++		rv = -ENOMEM;
++		goto out;
++	}
++	got = pin_user_pages_fast(a.addr, p->npages, FOLL_WRITE | FOLL_LONGTERM, p->pages);
++	if (got != p->npages) {
++		if (got > 0)
++			unpin_user_pages(p->pages, got);
++		kvfree(p->pages);
++		kvfree(p->dma);
++		memset(p, 0, sizeof(*p));
++		rv = got < 0 ? got : -EFAULT;
++		goto out;
++	}
++	for (i = 0; i < p->npages; i++) {
++		/* the mapping cleans each page once: lines the kernel's zero fill or the CPU left dirty */
++		p->dma[i] = dma_map_page(dev, p->pages[i], 0, PAGE_SIZE, DMA_FROM_DEVICE);
++		if (dma_mapping_error(dev, p->dma[i])) {
++			p->dma[i] = 0;
++			xdma_pin_release(dev, p);
++			rv = -EIO;
++			goto out;
++		}
++	}
++	p->addr = a.addr;
++	p->len = a.len;
++	p->flags = a.flags;
++	ps->n++;
++out:
++	mutex_unlock(&ps->lock);
++	return rv;
++}
++
++/*
++ * A read into a pinned buffer: one scatterlist entry a page from the bus addresses kept (the plain path's
++ * descriptors), the transfer as already mapped, then the CPU's cache invalidated over what was read (an
++ * earlier read's lines). -ENOENT when no pin holds the whole of [buf, buf + count): the plain path reads it.
++ */
++static ssize_t char_sgdma_read_pinned(struct xdma_cdev *xcdev, char __user *buf, size_t count,
++				      loff_t *pos)
++{
++	struct xdma_pins *ps = xcdev->pins;
++	struct device *dev;
++	struct xdma_engine *engine = xcdev->engine;
++	unsigned long a = (unsigned long)buf;
++	struct xdma_pin *p = NULL;
++	struct scatterlist *sg;
++	struct sg_table sgt;
++	unsigned int first, last, i;
++	size_t left;
++	ssize_t res;
++
++	if (!ps || !count)
++		return -ENOENT;
++	dev = &xcdev->xdev->pdev->dev;
++	mutex_lock(&ps->lock);
++	for (i = 0; i < ps->n; i++)
++		if (a >= ps->pin[i].addr && a + count <= ps->pin[i].addr + ps->pin[i].len) {
++			p = &ps->pin[i];
++			break;
++		}
++	if (!p) {
++		mutex_unlock(&ps->lock);
++		return -ENOENT;
++	}
++	first = (a - p->addr) >> PAGE_SHIFT;
++	last = (a + count - 1 - p->addr) >> PAGE_SHIFT;
++	if (sg_alloc_table(&sgt, last - first + 1, GFP_KERNEL)) {
++		mutex_unlock(&ps->lock);
++		return -ENOMEM;
++	}
++	left = count;
++	for (i = first, sg = sgt.sgl; i <= last; i++, sg = sg_next(sg)) {
++		unsigned int off = i == first ? offset_in_page(a) : 0;
++		unsigned int n = min_t(size_t, PAGE_SIZE - off, left);
++
++		if (!(p->flags & XDMA_PIN_CPU_READS_ONLY))
++			dma_sync_single_range_for_device(dev, p->dma[i], off, n, DMA_FROM_DEVICE);
++		sg_dma_address(sg) = p->dma[i] + off;
++		sg_dma_len(sg) = n;
++		left -= n;
++	}
++	sgt.nents = last - first + 1;
++	res = xdma_xfer_submit(xcdev->xdev, engine->channel, 0, *pos, &sgt, 1, c2h_timeout * 1000);
++	left = count;
++	for (i = first; i <= last; i++) {
++		unsigned int off = i == first ? offset_in_page(a) : 0;
++		unsigned int n = min_t(size_t, PAGE_SIZE - off, left);
++
++		dma_sync_single_range_for_cpu(dev, p->dma[i], off, n, DMA_FROM_DEVICE);
++		left -= n;
++	}
++	sg_free_table(&sgt);
++	mutex_unlock(&ps->lock);
++	return res;
++}
++#else
++static void xdma_unpin_all(struct xdma_cdev *xcdev)
++{
++}
++
++static int ioctl_do_pin(struct xdma_cdev *xcdev, unsigned long arg)
++{
++	return -ENOTTY;
++}
++
++static ssize_t char_sgdma_read_pinned(struct xdma_cdev *xcdev, char __user *buf, size_t count,
++				      loff_t *pos)
++{
++	return -ENOENT;
++}
++#endif
++
+ static ssize_t char_sgdma_read_write(struct file *file, const char __user *buf,
+ 		size_t count, loff_t *pos, bool write)
+ {
+@@ -406,6 +619,12 @@ static ssize_t char_sgdma_read_write(struct file *file, const char __user *buf,
+ 		return rv;
+ 	}
+ 
++	if (!write) {
++		res = char_sgdma_read_pinned(xcdev, (char __user *)buf, count, pos);
++		if (res != -ENOENT)
++			return res;
++	}
++
+ 	memset(&cb, 0, sizeof(struct xdma_io_cb));
+ 	cb.buf = (char __user *)buf;
+ 	cb.len = count;
+@@ -882,6 +1101,12 @@ static long char_sgdma_ioctl(struct file *file, unsigned int cmd,
+ 	case IOCTL_XDMA_APERTURE_W:
+ 		rv = ioctl_do_aperture_dma(engine, arg, 1);
+ 		break;
++	case IOCTL_XDMA_PIN:
++		rv = ioctl_do_pin(xcdev, arg);
++		break;
++	case IOCTL_XDMA_UNPIN:
++		xdma_unpin_all(xcdev);
++		break;
+ 	default:
+ 		dbg_perf("Unsupported operation\n");
+ 		rv = -EINVAL;
+@@ -924,6 +1149,10 @@ static int char_sgdma_close(struct inode *inode, struct file *file)
+ 
+ 	engine = xcdev->engine;
+ 
++	xdma_unpin_all(xcdev);
++	kfree(xcdev->pins);
++	xcdev->pins = NULL;
++
+ 	if (engine->streaming && engine->dir == DMA_FROM_DEVICE)
+ 		engine->device_open = 0;
+ 
+diff --git a/xdma/cdev_sgdma.h b/xdma/cdev_sgdma.h
+index 6f7ae15..bf2a36b 100644
+--- a/xdma/cdev_sgdma.h
++++ b/xdma/cdev_sgdma.h
+@@ -79,4 +79,23 @@ struct xdma_aperture_ioctl {
+ #define IOCTL_XDMA_APERTURE_R   _IOW('q', 7, struct xdma_aperture_ioctl *)
+ #define IOCTL_XDMA_APERTURE_W   _IOW('q', 8, struct xdma_aperture_ioctl *)
+ 
++/*
++ * A C2H reader's buffer pinned and DMA-mapped once, for every later read into it. A read that lies
++ * inside a pinned buffer skips the per-read page pinning, the scatterlist and the mapping, and only
++ * invalidates the CPU's cache over what it read. With XDMA_PIN_CPU_READS_ONLY the caller promises that
++ * the CPU never writes the buffer (the device alone does), so no line of it can be dirty: the clean
++ * before each transfer is skipped too (the pin itself cleans it once). A pin lasts until
++ * IOCTL_XDMA_UNPIN or the file's close; unmapping a pinned range first leaves the DMA going to the
++ * pinned pages, not to whatever is mapped there later.
++ */
++#define XDMA_PIN_CPU_READS_ONLY (1u << 0)
++struct xdma_pin_ioctl {
++	uint64_t addr;		/* page aligned */
++	uint64_t len;		/* a multiple of the page size */
++	uint32_t flags;		/* XDMA_PIN_* */
++	uint32_t rsvd;
++};
++#define IOCTL_XDMA_PIN          _IOW('q', 9, struct xdma_pin_ioctl)
++#define IOCTL_XDMA_UNPIN        _IO('q', 10)
++
+ #endif /* _XDMA_IOCALLS_POSIX_H_ */
+diff --git a/xdma/xdma_mod.h b/xdma/xdma_mod.h
+index 0fb7527..0389095 100644
+--- a/xdma/xdma_mod.h
++++ b/xdma/xdma_mod.h
+@@ -70,6 +70,7 @@ struct xdma_cdev {
+ 	struct xdma_user_irq *user_irq;	/* IRQ value, if needed */
+ 	struct device *sys_device;	/* sysfs device */
+ 	spinlock_t lock;
++	void *pins;			/* the reader's pinned buffers (cdev_sgdma.c) */
+ };
+ 
+ /* XDMA PCIe device specific book-keeping */

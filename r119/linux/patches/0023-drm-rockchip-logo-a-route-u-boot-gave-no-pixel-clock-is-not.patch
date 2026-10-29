@@ -1,0 +1,33 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: drm/rockchip: logo: a route U-Boot gave no pixel clock is not probed (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+At boot the Rockchip DRM driver tries to keep the picture the boot loader
+left on each output, and first reads the attached display's capabilities
+(for HDMI, its EDID). When the boot loader passed no pixel clock, no display
+mode can ever match, so that read only cost time: up to a second with some
+HDMI sinks. The driver now skips it and closes the route as before.
+
+---
+diff --git a/drivers/gpu/drm/rockchip/rockchip_drm_logo.c b/drivers/gpu/drm/rockchip/rockchip_drm_logo.c
+--- a/drivers/gpu/drm/rockchip/rockchip_drm_logo.c
++++ b/drivers/gpu/drm/rockchip/rockchip_drm_logo.c
+@@ -819,6 +819,18 @@
+ 
+ 	crtc->state->state = state;
+ 
++	/*
++	 * A route whose U-Boot left no pixel clock (no video,clock: a U-Boot that writes the
++	 * timings only) can match no mode below, as every mode has a
++	 * clock. Skip the connector probe, which for HDMI is an EDID read (a second with some
++	 * sinks), and let the caller close the route as for any other mismatch.
++	 */
++	if (!set->clock) {
++		dev_info(drm_dev->dev, "connector[%s]: no pixel clock from U-Boot; not probed\n",
++			 connector->name);
++		return -EINVAL;
++	}
++
+ 	conn_state = drm_atomic_get_connector_state(state, connector);
+ 	if (IS_ERR(conn_state))
+ 		return PTR_ERR(conn_state);

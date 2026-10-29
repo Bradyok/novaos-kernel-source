@@ -6,6 +6,7 @@ Each release is a tag here with a GitHub Release attached:
 
 | Release | Kernel | Boards | Complete source |
 |---|---|---|---|
+| [r119](https://github.com/Bradyok/novaos-kernel-source/releases/tag/r119) | Linux 6.12.114 (Rockchip 6.12 BSP + kernel.org 6.12 stable), 32 patches | RK3399: DHO800 / DHO900, MHO900 | `linux-6.12.114-novaos-r119.tar.xz` |
 | [r96](https://github.com/Bradyok/novaos-kernel-source/releases/tag/r96) | Linux 6.12.114 (Rockchip 6.12 BSP + kernel.org 6.12 stable), 30 patches | RK3399: DHO800 / DHO900, MHO900 | `linux-6.12.114-novaos-r96.tar.xz` |
 
 ## The downloads
@@ -38,8 +39,8 @@ Trusted Firmware-A) is in [Bradyok/novaos-boot-source](https://github.com/Bradyo
 
 On a Linux host with make, bc, flex, bison, the OpenSSL headers and an `aarch64-linux-gnu-` cross compiler:
 
-    tar -xJf linux-6.12.114-novaos-r96.tar.xz
-    sh linux-6.12.114-novaos-r96/build.sh /path/to/workdir
+    tar -xJf linux-6.12.114-novaos-r119.tar.xz
+    sh linux-6.12.114-novaos-r119/build.sh /path/to/workdir
 
 `BUILDING.txt` in the archive names the toolchain that gives byte-identical output.
 

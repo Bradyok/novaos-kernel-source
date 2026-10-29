@@ -1,0 +1,22 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: drm/bridge: dw-hdmi: the HPD work tolerates a CEC adapter not yet set (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+The BSP's DesignWare HDMI hot-plug work notified the CEC adapter without
+checking that one had been registered, so a monitor plugged in before the
+CEC device probed caused a NULL-pointer oops. Skip the CEC notification
+until the adapter exists.
+
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -642,7 +642,7 @@
+ 			if (hdmi->plat_data->set_ddc_io)
+ 				hdmi->plat_data->set_ddc_io(data, hdmi->hpd_state);
+ #if IS_REACHABLE(CONFIG_DRM_DW_HDMI_CEC)
+-			if (hdmi->cec_adap->devnode.registered)
++			if (hdmi->cec_adap && hdmi->cec_adap->devnode.registered)
+ 				cec_queue_pin_hpd_event(hdmi->cec_adap,
+ 							hdmi->hpd_state,
+ 							ktime_get());

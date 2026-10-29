@@ -1,0 +1,62 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: net: stmmac: dwmac-rk: stop the MAC's DMA at shutdown, so a kexec'd image keeps its memory (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+The Rockchip DWMAC glue had no shutdown hook, and the stmmac core has none
+either, so device_shutdown() left the Ethernet MAC running: its receive DMA
+went on writing every frame that arrived into the buffers the old kernel had
+given it. On a reboot the reset stops it; on a kexec those pages already
+belong to the next image, which then finds its data changed under it. The
+hook closes the interface (dev_close: stmmac_release stops the DMA, the MAC
+and the PHY and frees the rings), as the Cadence MACB driver's shutdown
+does, and detaches the device.
+
+---
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-rk.c
+@@ -22,6 +22,7 @@
+ #include <linux/mfd/syscon.h>
+ #include <linux/regmap.h>
+ #include <linux/pm_runtime.h>
++#include <linux/rtnetlink.h>
+ #include <linux/soc/rockchip/rk_vendor_storage.h>
+ #include <soc/rockchip/rockchip_csu.h>
+ #include "stmmac_platform.h"
+@@ -3748,6 +3749,28 @@ static void rk_gmac_remove(struct platform_device *pdev)
+ 		reset_control_put(bsp_priv->phy_reset);
+ }
+ 
++/*
++ * Stop the MAC's DMA when the system goes down. Without a shutdown hook the receive DMA
++ * keeps running through device_shutdown(): after a kexec it goes on writing received
++ * frames into the buffers the old kernel gave it, which by then belong to the next image
++ * (a kexec'd boot loader found its initrd changed exactly there). Closing the interface
++ * stops the DMA and the MAC as `ip link set dev ... down` does (stmmac_release), as the
++ * Cadence MACB driver does in its own shutdown hook.
++ */
++static void rk_gmac_shutdown(struct platform_device *pdev)
++{
++	struct net_device *ndev = platform_get_drvdata(pdev);
++
++	if (!ndev)
++		return;
++
++	rtnl_lock();
++	if (netif_running(ndev))
++		dev_close(ndev);
++	netif_device_detach(ndev);
++	rtnl_unlock();
++}
++
+ #ifdef CONFIG_PM_SLEEP
+ static int rk_gmac_suspend(struct device *dev)
+ {
+@@ -3853,6 +3876,7 @@ MODULE_DEVICE_TABLE(of, rk_gmac_dwmac_match);
+ static struct platform_driver rk_gmac_dwmac_driver = {
+ 	.probe  = rk_gmac_probe,
+ 	.remove_new = rk_gmac_remove,
++	.shutdown = rk_gmac_shutdown,
+ 	.driver = {
+ 		.name           = "rk_gmac-dwmac",
+ 		.pm		= &rk_gmac_pm_ops,

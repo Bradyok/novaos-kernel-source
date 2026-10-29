@@ -1,0 +1,186 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: mfd: rk808: power-off runs the PMIC's own shutdown again, writing that PMIC's registers (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+The syscore shutdown hook tested each PMIC's shutdown function pointer the
+wrong way round, so no RK8xx PMIC was ever switched off and power-off left
+every rail on. Fix the test. The RK805, RK808, RK816 and RK818 shutdown
+functions now mask the RTC interrupts at their own registers (they used the
+RK817's addresses, outside the RK808's register map), do nothing on restart,
+and return an error after a short wait instead of spinning forever when the
+PMIC stays up, so power-off falls through to PSCI. The RK801, RK809 and
+RK817 are unchanged.
+
+---
+--- a/drivers/mfd/rk808.c
++++ b/drivers/mfd/rk808.c
+@@ -1009,76 +1009,80 @@ static int rk801_shutdown(struct rk808 *rk808)
+ 	return ret;
+ }
+ 
+-static int rk805_shutdown(struct rk808 *rk808)
++/*
++ * The RK805, RK808, RK816 and RK818 keep the RTC's alarm and periodic interrupt
++ * masks in bits 5 and 6 of the interrupt-mask register at 0x4d
++ * (RK805_INT_STS_MSK_REG, RK808_INT_STS_MSK_REG1, RK816_INT_STS_MSK_REG2,
++ * RK818_INT_STS_MSK_REG1) and the RTC's own enables in bits 2 and 3 of
++ * RK808_RTC_INT_REG (0x12). Rockchip's develop-4.4 rk808.c closed exactly these
++ * before cutting power (rk808_syscore_shutdown, rk805_shutdown_prepare), so an
++ * armed alarm cannot switch the PMIC back on. 0xf9 and 0x0f, which these
++ * functions used to write, are the RK809/RK817 places for the same bits: past
++ * the end of an RK808's regmap (0x50), an unrelated register on the others.
++ */
++static void rk8xx_close_rtc_int(struct rk808 *rk808, unsigned int int_msk_reg)
+ {
+-	int ret = 0;
+-
+-	/* close rtc int when power off */
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_INT_STS_MSK_REG0,
++	regmap_update_bits(rk808->regmap, int_msk_reg,
+ 			   (0x3 << 5), (0x3 << 5));
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_RTC_INT_REG,
++	regmap_update_bits(rk808->regmap, RK808_RTC_INT_REG,
+ 			   (0x3 << 2), (0x0 << 2));
++}
+ 
+-	if (system_state != SYSTEM_POWER_OFF)
++/*
++ * Cut every rail by register. The PMIC drops its outputs within microseconds of
++ * the write; a CPU still running 10 ms later means it did not, and the caller
++ * returns, so the rest of kernel_power_off() (PSCI SYSTEM_OFF, then the dummy
++ * pm_power_off) runs instead of a silent spin here.
++ */
++static int rk8xx_dev_off(struct rk808 *rk808, unsigned int reg, unsigned int bit)
++{
++	int ret;
++
++	ret = regmap_update_bits(rk808->regmap, reg, bit, bit);
++	if (ret) {
++		dev_err(&rk808->i2c->dev, "Failed to shutdown device: %d\n", ret);
+ 		return ret;
++	}
+ 
+-	mdelay(200);
++	mdelay(10);
++	dev_err(&rk808->i2c->dev, "still running 10 ms after the power-off write\n");
++	return -ETIMEDOUT;
++}
+ 
+-	ret = regmap_update_bits(rk808->regmap, RK805_DEV_CTRL_REG,
+-				 DEV_OFF, DEV_OFF);
+-	if (ret)
+-		dev_err(&rk808->i2c->dev, "Failed to shutdown device!\n");
++/*
++ * Called by rk808_syscore_shutdown() on power-off and on restart; only a
++ * power-off touches the PMIC. A restart leaves the RTC interrupts as they are,
++ * so an alarm armed before a reboot stays armed.
++ */
++static int rk805_shutdown(struct rk808 *rk808)
++{
++	if (system_state != SYSTEM_POWER_OFF)
++		return 0;
+ 
+-	while (1)
+-		;
++	rk8xx_close_rtc_int(rk808, RK805_INT_STS_MSK_REG);
++	mdelay(200);
++
++	return rk8xx_dev_off(rk808, RK805_DEV_CTRL_REG, DEV_OFF);
+ }
+ 
+ static int rk808_shutdown(struct rk808 *rk808)
+ {
+-	int ret = 0;
+-
+-	/* close rtc int when power off */
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_INT_STS_MSK_REG0,
+-			   (0x3 << 5), (0x3 << 5));
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_RTC_INT_REG,
+-			   (0x3 << 2), (0x0 << 2));
+-
+ 	if (system_state != SYSTEM_POWER_OFF)
+-		return ret;
++		return 0;
+ 
+-	ret = regmap_update_bits(rk808->regmap, RK808_DEVCTRL_REG,
+-				 DEV_OFF_RST, DEV_OFF_RST);
+-	if (ret)
+-		dev_err(&rk808->i2c->dev, "Failed to shutdown device!\n");
+-	while (1)
+-		;
++	rk8xx_close_rtc_int(rk808, RK808_INT_STS_MSK_REG1);
++
++	return rk8xx_dev_off(rk808, RK808_DEVCTRL_REG, DEV_OFF_RST);
+ }
+ 
+ static int rk816_shutdown(struct rk808 *rk808)
+ {
+-	int ret = 0;
+-
+-	/* close rtc int when power off */
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_INT_STS_MSK_REG0,
+-			   (0x3 << 5), (0x3 << 5));
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_RTC_INT_REG,
+-			   (0x3 << 2), (0x0 << 2));
+-
+ 	if (system_state != SYSTEM_POWER_OFF)
+-		return ret;
++		return 0;
+ 
+-	ret = regmap_update_bits(rk808->regmap, RK816_DEV_CTRL_REG,
+-				 DEV_OFF, DEV_OFF);
+-	if (ret)
+-		dev_err(&rk808->i2c->dev, "Failed to shutdown device!\n");
+-	while (1)
+-		;
++	rk8xx_close_rtc_int(rk808, RK816_INT_STS_MSK_REG2);
++
++	return rk8xx_dev_off(rk808, RK816_DEV_CTRL_REG, DEV_OFF);
+ }
+ 
+ static int rk817_shutdown(struct rk808 *rk808)
+@@ -1108,26 +1112,12 @@ static int rk817_shutdown(struct rk808 *rk808)
+ 
+ static int rk818_shutdown(struct rk808 *rk808)
+ {
+-	int ret = 0;
+-
+-	/* close rtc int when power off */
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_INT_STS_MSK_REG0,
+-			   (0x3 << 5), (0x3 << 5));
+-	regmap_update_bits(rk808->regmap,
+-			   RK817_RTC_INT_REG,
+-			   (0x3 << 2), (0x0 << 2));
+-
+ 	if (system_state != SYSTEM_POWER_OFF)
+-		return ret;
++		return 0;
+ 
+-	ret = regmap_update_bits(rk808->regmap, RK818_DEVCTRL_REG,
+-				 DEV_OFF, DEV_OFF);
++	rk8xx_close_rtc_int(rk808, RK818_INT_STS_MSK_REG1);
+ 
+-	if (ret)
+-		dev_err(&rk808->i2c->dev, "Failed to shutdown device!\n");
+-	while (1)
+-		;
++	return rk8xx_dev_off(rk808, RK818_DEVCTRL_REG, DEV_OFF);
+ }
+ 
+ static int rk8xx_generic_shutdown(struct rk808 *rk808)
+@@ -1262,7 +1252,7 @@ static void rk808_syscore_shutdown(void)
+ 			continue;
+ 		}
+ 
+-		if (entry->rk808->shutdown) {
++		if (!entry->rk808->shutdown) {
+ 			pr_warn("RK808: No shutdown function for PMIC variant 0x%lx\n",
+ 				entry->rk808->variant);
+ 			continue;

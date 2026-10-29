@@ -1,0 +1,22 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: drm/bridge: dw-hdmi: the CEC wake-up interrupt is optional, so ask for it as one
+Copyright (C) 2026 Olympian LED, Inc.
+
+The DesignWare HDMI probe looks for a second interrupt for CEC wake-up,
+which most Rockchip HDMI blocks do not have, and the platform core logged
+its absence as an error on every boot. Request it as an optional interrupt;
+nothing else changes.
+
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -5994,7 +5994,7 @@
+ 		cec.ops = &dw_hdmi_cec_ops;
+ 		cec.irq = irq;
+ 
+-		irq = platform_get_irq(pdev, 1);
++		irq = platform_get_irq_optional(pdev, 1);
+ 		if (irq < 0)
+ 			dev_dbg(hdmi->dev, "can't get cec wake up irq\n");
+ 
