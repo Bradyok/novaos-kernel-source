@@ -44,6 +44,30 @@ On a Linux host with make, bc, flex, bison, the OpenSSL headers and an `aarch64-
 
 `BUILDING.txt` in the archive names the toolchain that gives byte-identical output.
 
+### What the build makes, and where
+
+The build is out of tree: nothing is written into the unpacked `linux/`. In the work directory:
+
+| What | Where |
+|---|---|
+| The kernel image | `kbuild-6.12-dho900/arch/arm64/boot/Image` |
+| The device tree blobs | `kbuild-6.12-dho900/arch/arm64/boot/dts/rockchip/rk3399-rigol-dho900.dtb`, `rk3399-rigol-mho900.dtb` |
+| Every module, installed (r119: 380) | `modroot/lib/modules/6.12.114+/`, the out-of-tree drivers in its `updates/` |
+
+Two of the modules carry the scope's acquisition data, and both must stay modules:
+
+- `kernel/drivers/pci/controller/pcierockchiphost.ko`: the RK3399 PCIe host (`CONFIG_PCIE_ROCKCHIP_HOST=m`). Its
+  sources are `pcie-rockchip-host.c` and `pcie-rockchip.c`, which kbuild links into one module named
+  `pcierockchiphost`, so no build makes a `pcie-rockchip-host.ko`. The host trains the PCIe link once, when it
+  probes, and the link to the acquisition FPGA trains only after the FPGA has booted its acquisition image. Built
+  into the kernel (Rockchip's `rockchip_linux_defconfig` has it `=y`), it probes at boot, before the FPGA is up,
+  and the link fails. Build with the release's own `.config`.
+- `updates/xdma.ko`: Xilinx's XDMA driver with our patch, built by the same `build.sh`.
+
+NovaOS loads `pcierockchiphost`, and then `xdma` with `poll_mode=1`, by name once the FPGA has booted, from its
+own FPGA service, which is not part of this source. Its `/etc/modprobe.d/nova-dho900.conf` blacklists both, so
+udev does not load either one early by its alias. On another root file system with udev, blacklist both the same way.
+
 ## License and credit
 
 The Linux kernel is licensed under GPL-2.0. Our patches to it are under the license of the files they change. Our
