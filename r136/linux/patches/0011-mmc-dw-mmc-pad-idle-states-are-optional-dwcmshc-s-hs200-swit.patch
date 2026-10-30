@@ -1,0 +1,57 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: mmc: dw_mmc pad-idle states are optional; dwcmshc's HS200 switch clock is expected
+Copyright (C) 2026 Olympian LED, Inc.
+
+dw_mmc warned when a host has neither of the optional pad states used to
+idle an SD slot's pins; that is a valid configuration, so only a host naming
+one state without the other still warns. In sdhci-of-dwcmshc, the expected
+HS200 switch step at the 52 MHz clock no longer logs an error.
+
+---
+diff --git a/drivers/mmc/host/dw_mmc.c b/drivers/mmc/host/dw_mmc.c
+--- a/drivers/mmc/host/dw_mmc.c
++++ b/drivers/mmc/host/dw_mmc.c
+@@ -3522,12 +3522,16 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
+ 	host->pinctrl = devm_pinctrl_get(host->dev);
+ 	if (!IS_ERR(host->pinctrl)) {
+ 		host->normal_state = pinctrl_lookup_state(host->pinctrl, "normal");
+-		if (IS_ERR(host->normal_state))
+-			dev_warn(dev, "No normal pinctrl state\n");
+-
+ 		host->idle_state = pinctrl_lookup_state(host->pinctrl, "idle");
+-		if (IS_ERR(host->idle_state))
+-			dev_warn(dev, "No idle pinctrl state\n");
++
++		/*
++		 * Pad idling is optional. A host that names neither state (a
++		 * non-removable SDIO slot has no card-detect pad to idle) simply never
++		 * switches; only a host that names one of the pair is misconfigured.
++		 */
++		if (IS_ERR(host->normal_state) != IS_ERR(host->idle_state))
++			dev_warn(dev, "No %s pinctrl state\n",
++				 IS_ERR(host->normal_state) ? "normal" : "idle");
+ 
+ 		if (!IS_ERR(host->normal_state) && !IS_ERR(host->idle_state))
+ 			pinctrl_select_state(host->pinctrl, host->idle_state);
+diff --git a/drivers/mmc/host/sdhci-of-dwcmshc.c b/drivers/mmc/host/sdhci-of-dwcmshc.c
+--- a/drivers/mmc/host/sdhci-of-dwcmshc.c
++++ b/drivers/mmc/host/sdhci-of-dwcmshc.c
+@@ -795,9 +795,17 @@ static void dwcmshc_rk3568_set_clock(struct sdhci_host *host, unsigned int clock
+ 	if (clock <= 52000000) {
+ 		/* Disable DLL */
+ 		sdhci_writel(host, 0, DWCMSHC_EMMC_DLL_CTRL);
++		/*
++		 * The mmc core itself runs HS200 timing at the HS clock while it
++		 * switches: mmc_select_hs200() sets the timing, then hs_max_dtr (52 MHz),
++		 * and checks the switch with SEND_STATUS before tuning at full speed
++		 * ("Some cards don't handle SEND_STATUS reliably at the initial
++		 * frequency", core/mmc.c). Leaving the DLL off there is the expected
++		 * path, so it is logged at debug level.
++		 */
+ 		if (host->mmc->ios.timing == MMC_TIMING_MMC_HS200 ||
+ 		    host->mmc->ios.timing == MMC_TIMING_MMC_HS400) {
+-			dev_err(mmc_dev(host->mmc),
++			dev_dbg(mmc_dev(host->mmc),
+ 				"Can't reduce the clock below 52MHz in HS200/HS400 mode");
+ 			goto exit;
+ 		}

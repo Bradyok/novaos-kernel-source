@@ -1,0 +1,268 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: cdc_ncm: an ASIX AX88179A/B gets one USB suspend/resume after open, which starts its link notifications (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+An ASIX AX88179A or AX88179B USB gigabit Ethernet adapter, run by the
+standard CDC NCM driver, never reported its link after it was plugged in or
+the unit was switched on, so the network interface stayed without carrier
+and got no address although the adapter's own lights showed the link. The
+adapter only starts reporting after a USB suspend and resume; when the
+interface is opened and the adapter stays silent, the driver now gives it
+one, and puts the power settings back.
+
+---
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -48,6 +48,8 @@
+ #include <linux/mii.h>
+ #include <linux/crc32.h>
+ #include <linux/usb.h>
++#include <linux/pm_runtime.h>
++#include <linux/delay.h>
+ #include <linux/hrtimer.h>
+ #include <linux/atomic.h>
+ #include <linux/usb/usbnet.h>
+@@ -767,6 +769,137 @@
+ 					   USB_ENDPOINT_NUMBER_MASK);
+ }
+ 
++/* ASIX AX88179A/B (0b95:1790, bcdDevice 2.00) in its CDC NCM configuration sends no notification at all -- no
++ * NetworkConnection, so the carrier never comes on although its PHY has the link -- from power-up until it has been
++ * through a USB suspend and resume. After the resume it sends SpeedChange and NetworkConnection every interrupt
++ * interval (128 ms at high speed), across ifdown/ifup, but a rebind can silence it again. Measured on an AX88179B by
++ * usbmon (2026-10-09): after power-up, 20 s of polling ep 0x81 across rebinds,
++ * re-enumeration, configuration changes, polling started before the data interface's SET_INTERFACE, and
++ * SET/CLEAR_FEATURE(DEVICE_REMOTE_WAKEUP) gave nothing; after one runtime suspend (210 ms) and resume the first
++ * SpeedChange (1 Gb/s) came 73 ms later, and the carrier with it; then 4 of 5 reloads of this driver brought it back to
++ * silence (nothing in 5.5 s after open). Upstream has the same report with no fix: "cdc_ncm doesn't detect link unless
++ * ethtool is run (ASIX AX88179B)", LKML 2025-11-15 -- ethtool runtime-resumes the netdev's parent, which on an adapter
++ * that had autosuspended is that resume.
++ *
++ * So each time the interface is opened (the interrupt pipe polled, remote wakeup asked for: the state the measurement
++ * had) and no notification has come CDC_NCM_ASIX_KICK_WAIT later, the device is let autosuspend at once, is resumed
++ * CDC_NCM_ASIX_KICK_HOLD_MS after it went down (about as long as in the measurement), and the runtime PM policy it
++ * had (power/control, autosuspend_delay_ms) is put back. A device that notifies is left alone. At most one
++ * suspend/resume, ~0.7 s after open, per open; a timeout warns.
++ */
++#define CDC_NCM_ASIX_KICK_WAIT		msecs_to_jiffies(500)
++#define CDC_NCM_ASIX_KICK_TIMEOUT	(3 * HZ)
++#define CDC_NCM_ASIX_KICK_HOLD_MS	200
++
++static bool cdc_ncm_needs_asix_kick(struct usb_device *udev)
++{
++	return le16_to_cpu(udev->descriptor.idVendor) == 0x0b95 &&
++	       le16_to_cpu(udev->descriptor.idProduct) == 0x1790 &&
++	       le16_to_cpu(udev->descriptor.bcdDevice) == 0x0200;
++}
++
++static bool cdc_ncm_asix_kick_ended(struct cdc_ncm_ctx *ctx)
++{
++	return READ_ONCE(ctx->asix_kick_abort) || atomic_read(&ctx->stop);
++}
++
++static void cdc_ncm_asix_kick_work(struct work_struct *work)
++{
++	struct cdc_ncm_ctx *ctx = container_of(to_delayed_work(work), struct cdc_ncm_ctx, asix_kick);
++	struct usb_device *udev = ctx->dev->udev;
++	struct device *d = &udev->dev;
++	bool allowed = d->power.runtime_auto;
++	int delay = d->power.autosuspend_delay;
++
++	if (!READ_ONCE(ctx->asix_kick_needed) || cdc_ncm_asix_kick_ended(ctx))
++		return;
++	WRITE_ONCE(ctx->asix_kick_suspended, false);
++	WRITE_ONCE(ctx->asix_kick_resumed, false);
++	pm_runtime_set_autosuspend_delay(d, 0);
++	if (!allowed)
++		usb_enable_autosuspend(udev);
++	wait_event_timeout(ctx->asix_kick_wq,
++			   READ_ONCE(ctx->asix_kick_suspended) || cdc_ncm_asix_kick_ended(ctx),
++			   CDC_NCM_ASIX_KICK_TIMEOUT);
++	/* as long down as it was when measured */
++	if (READ_ONCE(ctx->asix_kick_suspended))
++		msleep(CDC_NCM_ASIX_KICK_HOLD_MS);
++	pm_runtime_set_autosuspend_delay(d, delay);
++	if (!allowed) {
++		/* forbidding resumes it */
++		usb_disable_autosuspend(udev);
++	} else if (READ_ONCE(ctx->asix_kick_suspended) && !usb_autopm_get_interface(ctx->control)) {
++		/* autosuspend is the user's policy: resume it once, and let that policy go on */
++		usb_autopm_put_interface(ctx->control);
++	}
++
++	if (READ_ONCE(ctx->asix_kick_suspended) && READ_ONCE(ctx->asix_kick_resumed)) {
++		WRITE_ONCE(ctx->asix_kick_needed, false);
++		dev_info(&ctx->control->dev,
++			 "ASIX AX88179A/B: suspended and resumed once, which starts its link notifications\n");
++	} else if (!cdc_ncm_asix_kick_ended(ctx)) {
++		dev_warn(&ctx->control->dev,
++			 "ASIX AX88179A/B: did not autosuspend within %u ms, its link notifications may not start\n",
++			 jiffies_to_msecs(CDC_NCM_ASIX_KICK_TIMEOUT));
++	}
++}
++
++/* the interface is going down, or away: end a kick in progress (its policy put back) before it goes on */
++static void cdc_ncm_asix_kick_cancel(struct cdc_ncm_ctx *ctx)
++{
++	WRITE_ONCE(ctx->asix_kick_abort, true);
++	wake_up(&ctx->asix_kick_wq);
++	cancel_delayed_work_sync(&ctx->asix_kick);
++	WRITE_ONCE(ctx->asix_kick_abort, false);
++}
++
++static int cdc_ncm_manage_power(struct usbnet *dev, int on)
++{
++	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
++	int ret = usbnet_manage_power(dev, on);
++
++	if (ctx && ctx->asix_kick_device) {
++		if (on) {
++			/* until a notification says otherwise (cdc_ncm_status) */
++			WRITE_ONCE(ctx->asix_kick_needed, true);
++			schedule_delayed_work(&ctx->asix_kick, CDC_NCM_ASIX_KICK_WAIT);
++		} else {
++			cdc_ncm_asix_kick_cancel(ctx);
++		}
++	}
++	return ret;
++}
++
++static struct cdc_ncm_ctx *cdc_ncm_asix_kick_ctx(struct usb_interface *intf)
++{
++	struct usbnet *dev = usb_get_intfdata(intf);
++	struct cdc_ncm_ctx *ctx = dev ? (struct cdc_ncm_ctx *)dev->data[0] : NULL;
++
++	return ctx && READ_ONCE(ctx->asix_kick_needed) ? ctx : NULL;
++}
++
++static int cdc_ncm_suspend(struct usb_interface *intf, pm_message_t message)
++{
++	struct cdc_ncm_ctx *ctx = cdc_ncm_asix_kick_ctx(intf);
++	int ret = usbnet_suspend(intf, message);
++
++	if (!ret && ctx) {
++		WRITE_ONCE(ctx->asix_kick_suspended, true);
++		wake_up(&ctx->asix_kick_wq);
++	}
++	return ret;
++}
++
++static int cdc_ncm_resume(struct usb_interface *intf)
++{
++	struct cdc_ncm_ctx *ctx = cdc_ncm_asix_kick_ctx(intf);
++	int ret = usbnet_resume(intf);
++
++	if (!ret && ctx)
++		WRITE_ONCE(ctx->asix_kick_resumed, true);
++	return ret;
++}
++
+ static void cdc_ncm_free(struct cdc_ncm_ctx *ctx)
+ {
+ 	if (ctx == NULL)
+@@ -838,6 +971,8 @@
+ 	tasklet_setup(&ctx->bh, cdc_ncm_txpath_bh);
+ 	atomic_set(&ctx->stop, 0);
+ 	spin_lock_init(&ctx->mtx);
++	INIT_DELAYED_WORK(&ctx->asix_kick, cdc_ncm_asix_kick_work);
++	init_waitqueue_head(&ctx->asix_kick_wq);
+ 
+ 	/* store ctx pointer in device data field */
+ 	dev->data[0] = (unsigned long)ctx;
+@@ -1006,6 +1141,8 @@
+ 
+ 	atomic_set(&ctx->stop, 1);
+ 
++	cdc_ncm_asix_kick_cancel(ctx);
++
+ 	hrtimer_cancel(&ctx->tx_timer);
+ 
+ 	tasklet_kill(&ctx->bh);
+@@ -1067,6 +1204,8 @@
+ 
+ static int cdc_ncm_bind(struct usbnet *dev, struct usb_interface *intf)
+ {
++	int ret;
++
+ 	/* MBIM backwards compatible function? */
+ 	if (cdc_ncm_select_altsetting(intf) != CDC_NCM_COMM_ALTSETTING_NCM)
+ 		return -ENODEV;
+@@ -1075,7 +1214,10 @@
+ 	 * Additionally, generic NCM devices are assumed to accept arbitrarily
+ 	 * placed NDP.
+ 	 */
+-	return cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM, 0);
++	ret = cdc_ncm_bind_common(dev, intf, CDC_NCM_DATA_ALTSETTING_NCM, 0);
++	if (!ret && cdc_ncm_needs_asix_kick(dev->udev))
++		((struct cdc_ncm_ctx *)dev->data[0])->asix_kick_device = true;
++	return ret;
+ }
+ 
+ static void cdc_ncm_align_tail(struct sk_buff *skb, size_t modulus, size_t remainder, size_t max)
+@@ -1860,11 +2002,16 @@
+ 
+ static void cdc_ncm_status(struct usbnet *dev, struct urb *urb)
+ {
++	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+ 	struct usb_cdc_notification *event;
+ 
+ 	if (urb->actual_length < sizeof(*event))
+ 		return;
+ 
++	/* it notifies: no ASIX suspend/resume needed (cdc_ncm_asix_kick_work) */
++	if (ctx && ctx->asix_kick_needed)
++		WRITE_ONCE(ctx->asix_kick_needed, false);
++
+ 	/* test for split data in 8-byte chunks */
+ 	if (test_and_clear_bit(EVENT_STS_SPLIT, &dev->flags)) {
+ 		cdc_ncm_speed_change(dev,
+@@ -1919,7 +2066,7 @@
+ 			| FLAG_LINK_INTR | FLAG_ETHER,
+ 	.bind = cdc_ncm_bind,
+ 	.unbind = cdc_ncm_unbind,
+-	.manage_power = usbnet_manage_power,
++	.manage_power = cdc_ncm_manage_power,
+ 	.status = cdc_ncm_status,
+ 	.rx_fixup = cdc_ncm_rx_fixup,
+ 	.tx_fixup = cdc_ncm_tx_fixup,
+@@ -2122,9 +2269,9 @@
+ 	.id_table = cdc_devs,
+ 	.probe = usbnet_probe,
+ 	.disconnect = usbnet_disconnect,
+-	.suspend = usbnet_suspend,
+-	.resume = usbnet_resume,
+-	.reset_resume =	usbnet_resume,
++	.suspend = cdc_ncm_suspend,
++	.resume = cdc_ncm_resume,
++	.reset_resume =	cdc_ncm_resume,
+ 	.supports_autosuspend = 1,
+ 	.disable_hub_initiated_lpm = 1,
+ };
+--- a/include/linux/usb/cdc_ncm.h
++++ b/include/linux/usb/cdc_ncm.h
+@@ -40,6 +40,9 @@
+ #ifndef __LINUX_USB_CDC_NCM_H
+ #define __LINUX_USB_CDC_NCM_H
+ 
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
+ #define CDC_NCM_COMM_ALTSETTING_NCM		0
+ #define CDC_NCM_COMM_ALTSETTING_MBIM		1
+ 
+@@ -151,6 +154,15 @@
+ 	u64 tx_ntbs;
+ 	u64 rx_overhead;
+ 	u64 rx_ntbs;
++
++	/* the ASIX AX88179A/B's suspend/resume after an open with no notification (cdc_ncm.c, cdc_ncm_asix_kick_work) */
++	struct delayed_work asix_kick;
++	wait_queue_head_t asix_kick_wq;
++	bool asix_kick_device;
++	bool asix_kick_needed;
++	bool asix_kick_suspended;
++	bool asix_kick_resumed;
++	bool asix_kick_abort;
+ };
+ 
+ u8 cdc_ncm_select_altsetting(struct usb_interface *intf);

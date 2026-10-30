@@ -1,0 +1,40 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: gpiolib, regmap: two informational notices at info level
+Copyright (C) 2026 Olympian LED, Inc.
+
+Two notices are printed at info level instead of warning level: gpiolib's
+note that a chip uses a static GPIO base (the Rockchip numbering is relied
+on by user space), and regmap's note that a device without cache defaults is
+read back from the hardware once.
+
+---
+diff --git a/drivers/base/regmap/regcache.c b/drivers/base/regmap/regcache.c
+--- a/drivers/base/regmap/regcache.c
++++ b/drivers/base/regmap/regcache.c
+@@ -52,7 +52,8 @@ static int regcache_hw_init(struct regmap *map)
+ 
+ 	if (!map->reg_defaults_raw) {
+ 		bool cache_bypass = map->cache_bypass;
+-		dev_warn(map->dev, "No cache defaults, reading back from HW\n");
++		/* The documented fallback for a device with no default table (e.g. PMICs). */
++		dev_info(map->dev, "No cache defaults, reading back from HW\n");
+ 
+ 		/* Bypass the cache access till data read from HW */
+ 		map->cache_bypass = true;
+diff --git a/drivers/gpio/gpiolib.c b/drivers/gpio/gpiolib.c
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -1013,7 +1013,12 @@ int gpiochip_add_data_with_key(struct gpio_chip *gc, void *data,
+ 			 */
+ 			gc->base = base;
+ 		} else {
+-			dev_warn(&gdev->dev,
++			/*
++			 * Information, not a fault: a board whose GPIO numbers are a
++			 * user-space ABI (the Rockchip bank*32 bases with GPIO_SYSFS) sets
++			 * them on purpose.
++			 */
++			dev_info(&gdev->dev,
+ 				 "Static allocation of GPIO base is deprecated, use dynamic allocation.\n");
+ 		}
+ 

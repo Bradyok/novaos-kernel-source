@@ -1,0 +1,34 @@
+Installing a kernel you built from this source
+==============================================
+
+The release's kernel runs from its boot images. Each is an Android boot image (header version 0) in the
+format of the board's own boot loader: the kernel as an uncompressed arm64 Image, an initramfs, and the
+board's device tree as `rk-kernel.dtb` in a Rockchip resource container, with the loader's SHA-1 image id
+in the header. The loader refuses an image whose id does not match, and it builds the kernel's command
+line from the device tree's /chosen/bootargs. install/tools/boot/rk_bootimg.py reads and writes that
+format (python3, nothing beyond its standard library; dtc's fdtget and fdtput for step 3).
+
+1. Build the kernel, the device trees and the modules from this source (README.txt).
+
+2. Unpack the release's boot image (stage-b.img in the release's update):
+       python3 install/tools/boot/rk_bootimg.py show stage-b.img
+       python3 install/tools/boot/rk_bootimg.py unpack stage-b.img old/
+   old/ then holds kernel, ramdisk, rk-kernel.dtb and cmdline.txt.
+
+3. Give your device tree the command line the release's carries:
+       fdtput -t s my.dtb /chosen bootargs "$(fdtget old/rk-kernel.dtb /chosen bootargs)"
+
+4. Repack. Every part you do not name stays as the release has it, and the id is recomputed; a repack
+   that names no part gives the release's image back byte for byte.
+       python3 install/tools/boot/rk_bootimg.py repack stage-b.img --out new.img --kernel Image --dtb my.dtb
+   --ramdisk replaces the initramfs, a gzip-compressed newc cpio archive (for example to put a busybox
+   you built in it): `gzip -dc old/ramdisk | cpio -id` unpacks it, `find . | cpio -o -H newc | gzip -9`
+   packs it again.
+
+5. Modules: a kernel you changed needs its own modules, installed in the root file system under
+   /usr/lib/modules/<kernel release> (make modules_install INSTALL_MOD_PATH=<root>, then depmod).
+
+6. Write new.img in place of the image it was made from, in the `recovery` partition (the kernel names
+   it PARTNAME=recovery), from a root shell on the device. Keep the release's image: writing it back
+   restores the release. When the release also ships its own U-Boot (boot/ in its source), `recovery`
+   holds U-Boot's image instead, which carries this one: boot/build.sh --stage-b packs new.img into it.

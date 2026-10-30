@@ -1,0 +1,246 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: input: edt-ft5x06: "focaltech,ft5422", a FocalTech-firmware part identified by its chip id (6.12)
+Copyright (C) 2026 Olympian LED, Inc.
+
+Add a "focaltech,ft5422" compatible for FocalTech touch controllers that run
+FocalTech's own firmware. Such a part is identified by FocalTech's chip id
+registers (0xa3 and 0x9f, retried as the part comes out of reset) instead of
+the EDT model string, whose registers mean something else on FocalTech
+firmware and could swap the axes or select the wrong protocol. The EDT
+tuning registers, which FocalTech parts do not have, are never read or
+written, so the driver's only write to the part is the hibernate command on
+suspend. Every other compatible behaves as before; the binding gains the
+compatible.
+
+---
+--- a/Documentation/devicetree/bindings/input/touchscreen/edt-ft5x06.yaml
++++ b/Documentation/devicetree/bindings/input/touchscreen/edt-ft5x06.yaml
+@@ -39,6 +39,7 @@ properties:
+       - edt,edt-ft5406
+       - edt,edt-ft5506
+       - evervision,ev-ft5726
++      - focaltech,ft5422
+       - focaltech,ft5426
+       - focaltech,ft5452
+       - focaltech,ft6236
+--- a/drivers/input/touchscreen/edt-ft5x06.c
++++ b/drivers/input/touchscreen/edt-ft5x06.c
+@@ -63,6 +63,17 @@
+ #define FACTORY_REGISTER_OPMODE		0x01
+ #define PMOD_REGISTER_OPMODE		0xa5
+ 
++/*
++ * FocalTech's own identification registers: the chip id is 0xa3 (high byte) and 0x9f (low
++ * byte), the firmware version 0xa6. FocalTech's reference driver accepts a part on these two
++ * id bytes alone, retrying 5 times 200 ms apart after its reset.
++ */
++#define FT_REGISTER_CHIP_ID_HIGH	0xa3
++#define FT_REGISTER_CHIP_ID_LOW		0x9f
++#define FT_REGISTER_FW_VERSION		0xa6
++#define FT_CHIP_ID_RETRIES		5
++#define FT_CHIP_ID_RETRY_DELAY		200 /* msec */
++
+ #define TOUCH_EVENT_DOWN		0x00
+ #define TOUCH_EVENT_UP			0x01
+ #define TOUCH_EVENT_ON			0x02
+@@ -145,12 +156,18 @@ struct edt_ft5x06_ts_data {
+ 
+ 	struct edt_reg_addr reg_addr;
+ 	enum edt_ver version;
++	bool focaltech_id;
+ 	unsigned int crc_errors;
+ 	unsigned int header_errors;
+ };
+ 
+ struct edt_i2c_chip_data {
+ 	int  max_support_points;
++	/*
++	 * A FocalTech controller on its own firmware, not an EDT module: identify it by
++	 * FocalTech's chip-id registers instead of the EDT model-name and vendor-id guesses.
++	 */
++	bool focaltech_id;
+ };
+ 
+ static const struct regmap_config edt_ft5x06_i2c_regmap_config = {
+@@ -400,7 +417,8 @@ static ssize_t edt_ft5x06_setting_show(struct device *dev,
+ 	case EDT_M09:
+ 	case EDT_M12:
+ 	case GENERIC_FT:
+-		addr = attr->addr_m09;
++		/* a FocalTech-firmware part keeps its tuning in its own firmware */
++		addr = tsdata->focaltech_id ? NO_REGISTER : attr->addr_m09;
+ 		break;
+ 
+ 	case EV_FT:
+@@ -474,7 +492,8 @@ static ssize_t edt_ft5x06_setting_store(struct device *dev,
+ 	case EDT_M09:
+ 	case EDT_M12:
+ 	case GENERIC_FT:
+-		addr = attr->addr_m09;
++		/* a FocalTech-firmware part keeps its tuning in its own firmware */
++		addr = tsdata->focaltech_id ? NO_REGISTER : attr->addr_m09;
+ 		break;
+ 
+ 	case EV_FT:
+@@ -587,8 +606,10 @@ static void edt_ft5x06_restore_reg_parameters(struct edt_ft5x06_ts_data *tsdata)
+ 	struct edt_reg_addr *reg_addr = &tsdata->reg_addr;
+ 	struct regmap *regmap = tsdata->regmap;
+ 
+-	regmap_write(regmap, reg_addr->reg_threshold, tsdata->threshold);
+-	regmap_write(regmap, reg_addr->reg_gain, tsdata->gain);
++	if (reg_addr->reg_threshold != NO_REGISTER)
++		regmap_write(regmap, reg_addr->reg_threshold, tsdata->threshold);
++	if (reg_addr->reg_gain != NO_REGISTER)
++		regmap_write(regmap, reg_addr->reg_gain, tsdata->gain);
+ 	if (reg_addr->reg_offset != NO_REGISTER)
+ 		regmap_write(regmap, reg_addr->reg_offset, tsdata->offset);
+ 	if (reg_addr->reg_offset_x != NO_REGISTER)
+@@ -853,6 +874,54 @@ static void edt_ft5x06_ts_teardown_debugfs(struct edt_ft5x06_ts_data *tsdata)
+ 
+ #endif /* CONFIG_DEBUGFS */
+ 
++/*
++ * A FocalTech controller running FocalTech's firmware (not an EDT module) is identified the
++ * way FocalTech's own driver does it: by the chip id in 0xa3/0x9f. The EDT heuristics below
++ * would read 0xbb for an EDT model string and then take 0xa8 -- on these parts the panel
++ * maker's vendor id -- as a model number, and a panel whose vendor id happens to be 0x59 would
++ * be driven as an Evervision FT5726 with x and y swapped. Its touch data is FocalTech's
++ * standard report (TD_STATUS at 0x02, 6-byte points from 0x03), which is what GENERIC_FT reads.
++ */
++static int edt_ft5x06_focaltech_identify(struct i2c_client *client,
++					 struct edt_ft5x06_ts_data *tsdata)
++{
++	unsigned int id_high = 0, id_low = 0, fw_version = 0;
++	int retries = FT_CHIP_ID_RETRIES;
++	int error;
++
++	for (;;) {
++		error = regmap_read(tsdata->regmap, FT_REGISTER_CHIP_ID_HIGH,
++				    &id_high);
++		if (!error)
++			error = regmap_read(tsdata->regmap,
++					    FT_REGISTER_CHIP_ID_LOW, &id_low);
++		if (!error && id_high && id_high != 0xff && id_low)
++			break;
++		if (--retries == 0) {
++			dev_err(&client->dev,
++				"no FocalTech chip id: 0x%02x%02x, error %d\n",
++				id_high, id_low, error);
++			return error ?: -ENODEV;
++		}
++		msleep(FT_CHIP_ID_RETRY_DELAY);
++	}
++
++	error = regmap_read(tsdata->regmap, FT_REGISTER_FW_VERSION,
++			    &fw_version);
++	if (error)
++		return error;
++
++	tsdata->version = GENERIC_FT;
++	snprintf(tsdata->name, EDT_NAME_LEN, "FocalTech FT%02x%02x",
++		 id_high, id_low);
++	snprintf(tsdata->fw_version, EDT_NAME_LEN, "0x%02x", fw_version);
++	dev_info(&client->dev,
++		 "FocalTech chip id 0x%02x%02x, firmware 0x%02x, %d touch points\n",
++		 id_high, id_low, fw_version, tsdata->max_support_points);
++
++	return 0;
++}
++
+ static int edt_ft5x06_ts_identify(struct i2c_client *client,
+ 				  struct edt_ft5x06_ts_data *tsdata)
+ {
+@@ -862,6 +931,9 @@ static int edt_ft5x06_ts_identify(struct i2c_client *client,
+ 	char *model_name = tsdata->name;
+ 	char *fw_version = tsdata->fw_version;
+ 
++	if (tsdata->focaltech_id)
++		return edt_ft5x06_focaltech_identify(client, tsdata);
++
+ 	/* see what we find if we assume it is a M06 *
+ 	 * if we get less than EDT_NAME_LEN, we don't want
+ 	 * to have garbage in there
+@@ -986,13 +1058,15 @@ static void edt_ft5x06_ts_get_defaults(struct device *dev,
+ 
+ 	error = device_property_read_u32(dev, "threshold", &val);
+ 	if (!error) {
+-		regmap_write(regmap, reg_addr->reg_threshold, val);
++		if (reg_addr->reg_threshold != NO_REGISTER)
++			regmap_write(regmap, reg_addr->reg_threshold, val);
+ 		tsdata->threshold = val;
+ 	}
+ 
+ 	error = device_property_read_u32(dev, "gain", &val);
+ 	if (!error) {
+-		regmap_write(regmap, reg_addr->reg_gain, val);
++		if (reg_addr->reg_gain != NO_REGISTER)
++			regmap_write(regmap, reg_addr->reg_gain, val);
+ 		tsdata->gain = val;
+ 	}
+ 
+@@ -1024,8 +1098,10 @@ static void edt_ft5x06_ts_get_parameters(struct edt_ft5x06_ts_data *tsdata)
+ 	struct regmap *regmap = tsdata->regmap;
+ 	unsigned int val;
+ 
+-	regmap_read(regmap, reg_addr->reg_threshold, &tsdata->threshold);
+-	regmap_read(regmap, reg_addr->reg_gain, &tsdata->gain);
++	if (reg_addr->reg_threshold != NO_REGISTER)
++		regmap_read(regmap, reg_addr->reg_threshold, &tsdata->threshold);
++	if (reg_addr->reg_gain != NO_REGISTER)
++		regmap_read(regmap, reg_addr->reg_gain, &tsdata->gain);
+ 	if (reg_addr->reg_offset != NO_REGISTER)
+ 		regmap_read(regmap, reg_addr->reg_offset, &tsdata->offset);
+ 	if (reg_addr->reg_offset_x != NO_REGISTER)
+@@ -1117,6 +1193,16 @@ static void edt_ft5x06_ts_set_regs(struct edt_ft5x06_ts_data *tsdata)
+ 		reg_addr->reg_offset_y = NO_REGISTER;
+ 		reg_addr->reg_num_x = NO_REGISTER;
+ 		reg_addr->reg_num_y = NO_REGISTER;
++		/*
++		 * None of the M09 tuning registers is in FocalTech's own register map
++		 * for its parts (its driver touches 0xa5 power mode, nothing here), so a
++		 * FocalTech-firmware part is never written one, nor restored one on resume.
++		 */
++		if (tsdata->focaltech_id) {
++			reg_addr->reg_threshold = NO_REGISTER;
++			reg_addr->reg_gain = NO_REGISTER;
++			reg_addr->reg_offset = NO_REGISTER;
++		}
+ 		break;
+ 	}
+ }
+@@ -1181,6 +1267,7 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client)
+ 	}
+ 
+ 	tsdata->max_support_points = chip_data->max_support_points;
++	tsdata->focaltech_id = chip_data->focaltech_id;
+ 
+ 	tsdata->vcc = devm_regulator_get(&client->dev, "vcc");
+ 	if (IS_ERR(tsdata->vcc))
+@@ -1487,6 +1574,11 @@ static const struct edt_i2c_chip_data edt_ft5506_data = {
+ 	.max_support_points = 10,
+ };
+ 
++static const struct edt_i2c_chip_data edt_ft5422_data = {
++	.max_support_points = 10,
++	.focaltech_id = true,
++};
++
+ static const struct edt_i2c_chip_data edt_ft6236_data = {
+ 	.max_support_points = 2,
+ };
+@@ -1503,6 +1595,7 @@ static const struct i2c_device_id edt_ft5x06_ts_id[] = {
+ 	{ .name = "edt-ft5x06", .driver_data = (long)&edt_ft5x06_data },
+ 	{ .name = "edt-ft5506", .driver_data = (long)&edt_ft5506_data },
+ 	{ .name = "ev-ft5726", .driver_data = (long)&edt_ft5506_data },
++	{ .name = "ft5422", .driver_data = (long)&edt_ft5422_data },
+ 	{ .name = "ft5452", .driver_data = (long)&edt_ft5452_data },
+ 	/* Note no edt- prefix for compatibility with the ft6236.c driver */
+ 	{ .name = "ft6236", .driver_data = (long)&edt_ft6236_data },
+@@ -1518,6 +1611,7 @@ static const struct of_device_id edt_ft5x06_of_match[] = {
+ 	{ .compatible = "edt,edt-ft5406", .data = &edt_ft5x06_data },
+ 	{ .compatible = "edt,edt-ft5506", .data = &edt_ft5506_data },
+ 	{ .compatible = "evervision,ev-ft5726", .data = &edt_ft5506_data },
++	{ .compatible = "focaltech,ft5422", .data = &edt_ft5422_data },
+ 	{ .compatible = "focaltech,ft5426", .data = &edt_ft5506_data },
+ 	{ .compatible = "focaltech,ft5452", .data = &edt_ft5452_data },
+ 	/* Note focaltech vendor prefix for compatibility with ft6236.c */

@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Rigol MHO900 oscilloscope board (Rockchip RK3399, board code 3): the DHO800 / DHO900 board with
+ * the differences below. Several of the DHO's lines are other signals on this board, so the DHO
+ * file's consumers of them are changed or deleted here.
+ *
+ * Copyright (C) 2026 Olympian LED, Inc.
+ */
+
+#include "rk3399-rigol-dho900.dts"
+
+/ {
+	model = "Rigol MHO900 oscilloscope (RK3399)";
+	compatible = "rigol,mho900", "rockchip,rk3399";
+
+	aliases {
+		spi5 = &spi5;
+
+		rtc0 = &rx8010;
+		rtc1 = &rk808;
+	};
+
+	/* GPIO4_A5 is not a fan line on this board; its fan is the PWM1 pwm-fan below. */
+	/delete-node/ gpio-fan;
+
+	/* The fan on PWM1 at 40 us, full duty from probe until userspace sets it. */
+	pwm_fan: pwm-fan {
+		compatible = "pwm-fan";
+		pwms = <&pwm1 0 40000 0>;
+		#cooling-cells = <2>;
+	};
+};
+
+/* No backlight enable line: GPIO1_C2 is the LMK04826's chip select on this board. */
+&backlight {
+	/delete-property/ enable-gpios;
+};
+
+/* The beeper is on GPIO4_A4 (GPIO4_A3 is a DAC gear line). */
+&beeper_pwm {
+	gpios = <&gpio4 4 GPIO_ACTIVE_HIGH>;
+};
+
+/* PCIe PERST# is GPIO1_A3 on this board. */
+&pcie0 {
+	ep-gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
+};
+
+/* SPI1 off: its pins are UART4's here. */
+&spi1 {
+	status = "disabled";
+};
+
+/*
+ * SPI5: the FPGA's slave-serial configuration port, /dev/spidev5.0. Only CLK (GPIO2_C6) and TXD
+ * (GPIO2_C5) are SPI5's; GPIO2_C4 is the FPGA's DONE and GPIO2_C7 its INIT_B (GPIO inputs, pull-up).
+ * SCLK_SPI5 at 80 MHz from GPLL, so the bus runs at 40 MHz.
+ */
+&spi5 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi5_clk &spi5_tx>;
+	assigned-clocks = <&cru SCLK_SPI5>;
+	assigned-clock-parents = <&cru PLL_GPLL>;
+	assigned-clock-rates = <80000000>;
+	status = "okay";
+
+	spidev@0 {
+		compatible = "rockchip,spidev";
+		reg = <0>;
+		spi-max-frequency = <50000000>;
+	};
+};
+
+/* UART4: the generator's microcontroller, 115200 8N1. */
+&uart4 {
+	status = "okay";
+};
+
+&pwm1 {
+	status = "okay";
+};
+
+/* I2C1 off: its pins (GPIO4_A1 / A2) are DAC gear lines here. */
+&i2c1 {
+	status = "disabled";
+};
+
+/* I2C7: the battery-backed RX8010 RTC at 0x32 (rtc0), interrupt GPIO2_A3. */
+&i2c7 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	rx8010: rtc@32 {
+		compatible = "epson,rx8010";
+		reg = <0x32>;
+		interrupt-parent = <&gpio2>;
+		interrupts = <3 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/* The panel's init sequence differs; everything else on the DSI path is the DHO's. */
+&dsi {
+	panel@0 {
+		panel-init-sequence = [
+			15 00 02 80 40
+			15 00 02 81 cf
+			15 00 02 82 87
+			15 00 02 83 5d
+			15 00 02 84 40
+			15 00 02 85 11
+			15 00 02 86 82
+		];
+	};
+};
+
+&pinctrl {
+	pinctrl-0 = <&pcie_perst_float &afe_spi_pins &fpga_cfg_status>;
+
+	rigol-fpga {
+		fpga_cfg_status: fpga-cfg-status {
+			rockchip,pins = <2 20 0 &pcfg_pull_up>,
+					<2 23 0 &pcfg_pull_up>;
+		};
+	};
+};
+
+/*
+ * Line names, as userspace finds the board lines on the GPIO character device:
+ *   dac_ch<N>_a/b/c      channel N's DAC gear lines (code bits 0, 1, 2), outputs
+ *   afe_rms_channel1..4  the AFE overload comparators, inputs with no pull
+ *   hd_code0..3          the straps: board code = hd_code0 << 3 | hd_code1 << 2 | hd_code2 << 1 | hd_code3
+ *   spi_sclk/cs/sdio, sysref_reset   the LMK04826 clock bus
+ *   ADC_VCC_EN, AFE_VCC_EN, FPGA_VCC_EN, programb, done, initb   the supplies and the FPGA's control
+ */
+&gpio0 {
+	gpio-line-names =
+		/* A0-A7 */ "", "ADC_VCC_EN", "AFE_VCC_EN", "", "hd_code0", "power", "", "",
+		/* B0-B7 */ "hd_code1", "", "", "hd_code2", "hd_code3", "", "", "",
+		/* C0-C7 */ "", "", "", "", "", "", "", "",
+		/* D0-D7 */ "", "", "", "", "", "", "", "";
+};
+
+&gpio1 {
+	gpio-line-names =
+		/* A0-A7 */ "FPGA_VCC_EN", "", "", "ep", "", "", "", "",
+		/* B0-B7 */ "", "", "", "", "", "programb", "vsel", "",
+		/* C0-C7 */ "", "spi_sclk", "spi_cs", "spi_sdio", "reset", "", "sysref_reset", "vsel",
+		/* D0-D7 */ "", "", "", "", "", "", "", "";
+};
+
+&gpio2 {
+	gpio-line-names =
+		/* A0-A7 */ "", "", "spi_afe_cs_1", "rtc_int", "spi_afe_cs_3", "spi_afe_cs_2", "", "",
+		/* B0-B7 */ "", "spi_afe_miso", "spi_afe_mosi", "spi_afe_sclk", "spi_afe_cs_0", "", "", "",
+		/* C0-C7 */ "", "", "", "", "done", "", "", "initb",
+		/* D0-D7 */ "", "", "", "", "", "", "", "";
+};
+
+&gpio3 {
+	gpio-line-names =
+		/* A0-A7 */ "", "", "", "", "", "", "", "",
+		/* B0-B7 */ "", "", "", "", "", "", "", "mdio-reset",
+		/* C0-C7 */ "", "", "", "", "", "", "", "",
+		/* D0-D7 */ "LA_PROBE_DETECT", "", "dac_ch4_a", "dac_ch4_b", "dac_ch4_c", "dac_ch3_a", "dac_ch3_b", "dac_ch3_c";
+};
+
+&gpio4 {
+	gpio-line-names =
+		/* A0-A7 */ "", "dac_ch2_a", "dac_ch2_b", "dac_ch2_c", "PWM_GPIO", "", "fts_irq_gpio", "fts_reset_gpio",
+		/* B0-B7 */ "", "", "", "", "", "", "", "",
+		/* C0-C7 */ "", "", "", "", "", "dac_ch1_a", "", "",
+		/* D0-D7 */ "dac_ch1_b", "dac_ch1_c", "afe_rms_channel1", "afe_rms_channel2", "afe_rms_channel3",
+			    "afe_rms_channel4", "", "";
+
+	/* GPIO4_A5 is not a fan line here: never driven. */
+	/delete-node/ fan-power-hog;
+};

@@ -6,6 +6,7 @@ Each release is a tag here with a GitHub Release attached:
 
 | Release | Kernel | Boards | Complete source |
 |---|---|---|---|
+| [r136](https://github.com/Bradyok/novaos-kernel-source/releases/tag/r136) (also r137's kernel) | Linux 6.12.115 (Rockchip 6.12 BSP + kernel.org 6.12 stable), 32 patches | RK3399: DHO800 / DHO900, MHO900 | `linux-6.12.115-novaos-r136.tar.xz` |
 | [r119](https://github.com/Bradyok/novaos-kernel-source/releases/tag/r119) | Linux 6.12.114 (Rockchip 6.12 BSP + kernel.org 6.12 stable), 32 patches | RK3399: DHO800 / DHO900, MHO900 | `linux-6.12.114-novaos-r119.tar.xz` |
 | [r96](https://github.com/Bradyok/novaos-kernel-source/releases/tag/r96) | Linux 6.12.114 (Rockchip 6.12 BSP + kernel.org 6.12 stable), 30 patches | RK3399: DHO800 / DHO900, MHO900 | `linux-6.12.114-novaos-r96.tar.xz` |
 
@@ -17,14 +18,14 @@ Each release is a tag here with a GitHub Release attached:
 - `novaos-<release>.config`: its configuration;
 - `xdma/` and `rtw89/`: the out-of-tree drivers the release builds, as built;
 - `build.sh`: builds the kernel image, the device tree blobs and every module from the archive alone, with no
-  network;
+  network, and fails if either of the two modules below is missing;
 - `README.txt`: the written offer.
 
 **The patch set** (`linux-rk3399-scope-<release>.tar.xz`, also readable here under `<release>/`) is the same
 release as our changes only: the patches in the order they apply, the configuration, the device trees and the
-build scripts. Its `linux/build.sh` downloads the base tree,
-[Bradyok/linux-rockchip](https://github.com/Bradyok/linux-rockchip) at the commit `linux/BASE.env` names (tagged
-there for every release that uses it), and applies them.
+build scripts, and (from r136) `install/`, which puts a kernel you built into the release's boot image. Its
+`linux/build.sh` downloads the base tree, [Bradyok/linux-rockchip](https://github.com/Bradyok/linux-rockchip) at the
+commit `linux/BASE.env` names (tagged there for every release that uses it), and applies them.
 
 Every release is checked before it is published. A build from either archive alone matches the release's own
 kernel image, device trees and modules byte for byte. The complete tree is also built in a fresh directory with
@@ -39,8 +40,8 @@ Trusted Firmware-A) is in [Bradyok/novaos-boot-source](https://github.com/Bradyo
 
 On a Linux host with make, bc, flex, bison, the OpenSSL headers and an `aarch64-linux-gnu-` cross compiler:
 
-    tar -xJf linux-6.12.114-novaos-r119.tar.xz
-    sh linux-6.12.114-novaos-r119/build.sh /path/to/workdir
+    tar -xJf linux-6.12.115-novaos-r136.tar.xz
+    sh linux-6.12.115-novaos-r136/build.sh /path/to/workdir
 
 `BUILDING.txt` in the archive names the toolchain that gives byte-identical output.
 
@@ -52,7 +53,7 @@ The build is out of tree: nothing is written into the unpacked `linux/`. In the 
 |---|---|
 | The kernel image | `kbuild-6.12-dho900/arch/arm64/boot/Image` |
 | The device tree blobs | `kbuild-6.12-dho900/arch/arm64/boot/dts/rockchip/rk3399-rigol-dho900.dtb`, `rk3399-rigol-mho900.dtb` |
-| Every module, installed (r119: 380) | `modroot/lib/modules/6.12.114+/`, the out-of-tree drivers in its `updates/` |
+| Every module, installed (r136: 380) | `modroot/lib/modules/<kernel release>/` (`6.12.115+` for r136), the out-of-tree drivers in its `updates/` |
 
 Two of the modules carry the scope's acquisition data, and both must stay modules:
 

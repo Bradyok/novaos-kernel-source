@@ -1,0 +1,30 @@
+From: Brady <brady@aioscilloscope.com>
+Subject: of: reserved_mem: a zero-size region is a placeholder, not a failed reservation
+Copyright (C) 2026 Olympian LED, Inc.
+
+Device trees declare some reserved-memory regions with size 0 as
+placeholders that the bootloader fills in when it uses them. An untouched
+placeholder was reported as a failed reservation; skip zero-size regions
+quietly.
+
+---
+diff --git a/drivers/of/of_reserved_mem.c b/drivers/of/of_reserved_mem.c
+--- a/drivers/of/of_reserved_mem.c
++++ b/drivers/of/of_reserved_mem.c
+@@ -129,7 +129,15 @@ static int __init __reserved_mem_reserve_reg(unsigned long node,
+ 		base = dt_mem_next_cell(dt_root_addr_cells, &prop);
+ 		size = dt_mem_next_cell(dt_root_size_cells, &prop);
+ 
+-		if (size && early_init_dt_reserve_memory(base, size, nomap) == 0) {
++		if (!size) {
++			/*
++			 * A zero size is a placeholder that a bootloader fills in only when it
++			 * uses the region, e.g. the Rockchip U-Boot's drm-logo and drm-cubic-lut
++			 * after it has drawn a boot logo. Nothing to reserve, and not a failure.
++			 */
++			pr_debug("Reserved memory: node '%s' has a zero-size region, nothing reserved\n",
++				 uname);
++		} else if (early_init_dt_reserve_memory(base, size, nomap) == 0) {
+ 			/* Architecture specific contiguous memory fixup. */
+ 			if (of_flat_dt_is_compatible(node, "shared-dma-pool") &&
+ 			    of_get_flat_dt_prop(node, "reusable", NULL))
